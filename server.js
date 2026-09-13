@@ -2,9 +2,13 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import express from 'express';
 import multer from 'multer';
-import { config, ROOT, DATA_DIR, JOBS_DIR, MAX_CLIPS, LLM_PRICING, STT_PRICING } from './src/config.js';
-import { createJob, getJob, listJobs, saveJob, jobDir, bus, STAGES } from './src/jobs.js';
-import { enqueue } from './src/pipeline.js';
+import { config, ROOT, DATA_DIR, JOBS_DIR, MAX_CLIPS, LLM_PRICING, STT_PRICING, CAPTIK_APP_DIR } from './src/config.js';
+import { createJob, getJob, listJobs, saveJob, jobDir, bus, STAGES, logLine } from './src/jobs.js';
+import { enqueue, resumeQueued, queueRerender } from './src/pipeline.js';
+import { sanitizeEdit } from './src/captikRender.js';
+import { romanizeClips, needsRoman } from './src/romanize.js';
+import { llmLineItem, summarize } from './src/cost.js';
+import { loadTemplateCatalog } from './src/director.js';
 import { classifySource, SUPPORTED_PLATFORMS, ytdlpCommand } from './src/ingest.js';
 import { estimate, loadCalibration } from './src/cost.js';
 import { addFeedback, loadFeedback } from './src/feedback.js';
@@ -18,6 +22,8 @@ await fs.mkdir(UPLOAD_DIR, { recursive: true });
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(ROOT, 'public')));
+// Captik's fonts first (the editor + templates reference /fonts/*), then the clipper's own.
+app.use('/fonts', express.static(path.join(CAPTIK_APP_DIR, 'public', 'fonts')));
 app.use('/fonts', express.static(path.join(ROOT, 'assets', 'fonts')));
 app.use('/media', express.static(JOBS_DIR));
 
@@ -77,6 +83,72 @@ app.post('/api/jobs/:id/recurate', async (req, res, next) => {
 });
 
 app.get('/api/jobs', async (_req, res) => res.json(await listJobs()));
+
+app.get('/api/templates', async (_req, res, next) => {
+  try { res.json(await loadTemplateCatalog()); } catch (err) { next(err); }
+});
+
+// The editor saves a clip's Captik state (words, lines, template, colours, position) here.
+app.put('/api/jobs/:id/clips/:clipId/edit', async (req, res, next) => {
+  try {
+    const job = await getJob(req.params.id, { raw: true });
+    const clip = job?.clips.find((c) => c.id === req.params.clipId);
+    if (!clip?.edit) return res.status(404).json({ error: 'Clip not found or not styled yet' });
+    clip.edit = sanitizeEdit(req.body?.edit, clip.edit);
+    clip.dirty = true;
+    await saveJob(job);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Convert an existing job's Devanagari captions to romanized Hinglish, keep every word's timing and style,
+// add the cost to the job's receipt, and re-render the changed clips.
+app.post('/api/jobs/:id/romanize', async (req, res, next) => {
+  try {
+    const job = await getJob(req.params.id, { raw: true });
+    if (!job?.clips?.length) return res.status(404).json({ error: 'Job not found or has no clips' });
+    if (job.status === 'running' || job.status === 'queued') return res.status(409).json({ error: 'Wait for the job to finish first' });
+    const clips = job.clips.filter((c) => c.edit?.words && needsRoman(c.edit.words));
+    if (!clips.length) return res.json({ ok: true, romanized: 0, failed: [] });
+    const r = await romanizeClips(clips.map((c) => ({ id: c.id, words: c.edit.words })), { model: job.input.model });
+    for (const c of clips) {
+      const words = r.words.get(c.id);
+      if (words) c.edit = { ...c.edit, words };
+    }
+    if (job.cost?.items) {
+      job.cost = summarize([...job.cost.items, { ...llmLineItem(r.model, r.usage), stage: 'Romanize' }], {
+        sourceMinutes: (job.source?.duration || 60) / 60,
+        clipCount: job.clips.filter((c) => c.status === 'done').length,
+      });
+    }
+    logLine(job, `Romanized captions for ${r.words.size} clips${r.failed.length ? `; kept Devanagari for ${r.failed.join(', ')}` : ''}`);
+    const rerender = req.body?.render !== false ? clips.filter((c) => r.words.has(c.id) && c.base) : [];
+    for (const c of rerender) Object.assign(c, { status: 'queued', progress: 0 });
+    await saveJob(job);
+    for (const c of rerender) queueRerender(job, c.id).catch(() => {});
+    res.json({ ok: true, romanized: r.words.size, failed: r.failed, rerendering: rerender.map((c) => c.id), usage: r.usage });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Export from the editor: save the state (if sent) and re-render through Captik's composition.
+app.post('/api/jobs/:id/clips/:clipId/render', async (req, res, next) => {
+  try {
+    const job = await getJob(req.params.id, { raw: true });
+    const clip = job?.clips.find((c) => c.id === req.params.clipId);
+    if (!clip?.base || !clip.edit) return res.status(404).json({ error: 'Clip not found or not ready to render' });
+    if (req.body?.edit) clip.edit = sanitizeEdit(req.body.edit, clip.edit);
+    Object.assign(clip, { status: 'queued', progress: 0 });
+    await saveJob(job);
+    queueRerender(job, clip.id).catch(() => {});
+    res.status(202).json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
 
 app.get('/api/jobs/:id', async (req, res) => {
   const job = await getJob(req.params.id);
@@ -196,4 +268,5 @@ app.use((err, _req, res, _next) => {
 
 app.listen(config.port, '127.0.0.1', () => {
   console.log(`Captik Clipper running at http://localhost:${config.port}`);
+  resumeQueued().catch((err) => console.error('resume failed', err));
 });

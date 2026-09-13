@@ -122,6 +122,43 @@ export function layoutFilter({ width, height }, { layout, focusX }, track) {
   return `split=2[lc][lf];[lc]${crop()},setsar=1[crop];[lf]${fit('f')},setsar=1[fit];[fit][crop]overlay=0:0:enable='${on}'`;
 }
 
+/**
+ * The clip's 9:16 base video, cut from any input (a downloaded section or a full local file):
+ * per-shot tracked crop or letterbox, loudness-normalised to -14 LUFS, and NO captions — Captik's
+ * composition draws those on top. `inStart` is where the clip begins inside `inputFile`.
+ * Mutates clip.layout / clip.track with what the tracker decided.
+ */
+export async function renderBase({ inputFile, inStart, probe, clip, outFile, onProgress }) {
+  const local = { ...clip, start: inStart };
+  let track = null;
+  if (probe.width / probe.height > 0.8) {
+    try {
+      track = await trackSubject({ sourceFile: path.resolve(inputFile), probe, clip: local, prior: clip.focusX ?? 0.5 });
+      const modes = new Set(track.shots.map((s) => s.mode));
+      clip.layout = modes.size > 1 ? 'mixed' : [...modes][0];
+      clip.track = { keyframes: track.keys.length, cuts: track.cuts, shots: track.shots };
+    } catch {
+      track = null;
+    }
+  }
+  onProgress?.(0.2);
+  const args = [
+    '-v', 'error', '-y', '-nostats', '-progress', 'pipe:1',
+    '-ss', inStart.toFixed(3), '-t', clip.duration.toFixed(3), '-i', path.resolve(inputFile),
+    '-filter_complex', `[0:v]${layoutFilter(probe, local, track)},setsar=1,format=yuv420p[v]`, '-map', '[v]',
+  ];
+  if (probe.hasAudio) args.push('-map', '0:a:0', '-af', 'loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000', '-c:a', 'aac', '-b:a', '192k');
+  args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17', '-g', '30', '-movflags', '+faststart', path.resolve(outFile));
+  const r = await run(config.ffmpeg, args, {
+    onLine: (line) => {
+      const m = line.match(/^out_time_us=(\d+)/);
+      if (m) onProgress?.(0.2 + 0.8 * clamp(Number(m[1]) / 1e6 / clip.duration, 0, 1));
+    },
+  });
+  if (r.code !== 0) throw new Error(`Base render failed for ${clip.id}: ${r.stderr.trim().split(/\r?\n/).slice(-3).join(' ')}`);
+  return { track };
+}
+
 /** Render one clip to `<jobDir>/clips/<id>.mp4` plus a poster jpg. */
 export async function renderClip({ jobDir, sourceFile, probe, clip, words, captions = true, onProgress }) {
   const clipsDir = path.join(jobDir, 'clips');

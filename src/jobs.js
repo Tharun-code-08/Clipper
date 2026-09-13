@@ -6,9 +6,11 @@ import { JOBS_DIR } from './config.js';
 import { readJson, writeJson } from './util.js';
 
 export const STAGES = [
-  { key: 'ingest', label: 'Fetch video' },
-  { key: 'analyze', label: 'Listen & watch' },
-  { key: 'curate', label: 'Curate' },
+  { key: 'audio', label: 'Get audio' },
+  { key: 'transcribe', label: 'Transcribe' },
+  { key: 'curate', label: 'Pick best parts' },
+  { key: 'parts', label: 'Fetch parts' },
+  { key: 'style', label: 'Frames & style' },
   { key: 'score', label: 'Score' },
   { key: 'render', label: 'Render' },
 ];
@@ -48,11 +50,15 @@ export async function saveJob(job) {
   await writeJson(path.join(jobDir(job.id), 'job.json'), job);
 }
 
-export async function getJob(id) {
+export async function getJob(id, { raw = false } = {}) {
   if (!validId(id)) return null;
   if (live.has(id)) return live.get(id);
   const job = await readJson(path.join(jobDir(id), 'job.json'));
   if (!job) return null;
+  if (raw) {
+    live.set(id, job);
+    return job;
+  }
   if (job.status === 'queued' || job.status === 'running') {
     job.status = 'error';
     job.error = 'The server restarted while this job was running. Start it again.';
@@ -86,8 +92,13 @@ export function logLine(job, msg) {
   emit(job);
 }
 
+/** Jobs saved by an older build carry an older stage list; align them to the current one. */
+export function normalizeStages(job) {
+  job.stages = Object.fromEntries(STAGES.map((s) => [s.key, job.stages?.[s.key] || { status: 'pending', progress: 0 }]));
+}
+
 export function setStage(job, key, patch) {
-  const s = job.stages[key];
+  const s = (job.stages[key] ||= { status: 'pending', progress: 0 });
   if (patch.status === 'running' && !s.startedAt) s.startedAt = Date.now();
   if (patch.status === 'done' || patch.status === 'error') s.endedAt = Date.now();
   Object.assign(s, patch);

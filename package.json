@@ -6,14 +6,23 @@
   "scripts": {
     "test": "node --test \"test/**/*.test.js\"",
     "start": "node --env-file-if-exists=.env server.js",
-    "dev": "node --watch --env-file-if-exists=.env server.js",
-    "train": "node --env-file-if-exists=.env training/train.js"
+    "dev": "node --watch-path=server.js --watch-path=src --env-file-if-exists=.env server.js",
+    "train": "node --env-file-if-exists=.env training/train.js",
+    "build:editor": "vite build --config web/vite.config.mjs"
   },
   "license": "ISC",
   "type": "module",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.125.0",
     "express": "^5.2.1",
-    "multer": "^2.3.0"
+    "multer": "^2.3.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^6.1.1",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.3.0"
   }
 }

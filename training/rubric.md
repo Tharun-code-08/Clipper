@@ -26,7 +26,7 @@ Edit it like code: every rule here changes what the model picks.
 
 - **High-arousal emotion.** Awe, amusement, anger, anxiety, surprise spread far more than calm or sad
   content (Berger & Milkman, *What Makes Online Content Viral?*, 2012). Laughter, raised voices,
-  vulnerable admissions and gasps are gold — the `e4`/`e5` loudness marks and `✂` cuts help find them.
+  vulnerable admissions and gasps are gold — the `e4`/`e5` loudness marks and long pauses help find them.
 - **Social currency.** Sharing it makes the sharer look smart, funny, or in-the-know.
 - **Identity / tribe.** "Every founder / student / new parent needs to hear this."
 - **Practical value.** Specific tactics, steps, numbers, frameworks — these get saved and forwarded.
@@ -71,10 +71,3 @@ Use the full range. If every clip gets 8s, the ranking is useless.
   *add* to the first spoken line (a frame, a stake, a number), never repeat it verbatim.
 - `caption` — ≤ 150 characters, ends with a question or prompt that invites comments.
 - `hashtags` — 3–5, specific beats generic, no #viral / #fyp spam.
-
-## 6. Vertical layout (the render is 9:16)
-
-- `crop` — one speaker or one subject area. Set `focus_x` (0 = left edge, 1 = right edge) to the
-  subject's horizontal centre as seen in the frames closest to the clip.
-- `fit` — two or more people spread across the frame, slides, screen recordings, or on-screen text
-  that a crop would cut off. The render letterboxes over a blurred copy of the video.

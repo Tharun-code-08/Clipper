@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { config, DATA_DIR, LLM_PRICING, STT_PRICING, STT_MIN_BILLED_SEC, CACHE_READ_MULT, CACHE_WRITE_MULT, MAX_CLIPS } from './config.js';
+import { config, DATA_DIR, LLM_PRICING, STT_PRICING, STT_MIN_BILLED_SEC, CACHE_READ_MULT, CACHE_WRITE_MULT, MAX_CLIPS, ALIGN_USD_PER_HOUR, SARVAM_INR_PER_HOUR } from './config.js';
 import { readJson, writeJson } from './util.js';
 
 const CALIBRATION_FILE = path.join(DATA_DIR, 'calibration.json');
@@ -10,6 +10,11 @@ const HEURISTIC = {
   fixedInputTokens: 9000,
   inputTokensPerMinute: 300, // ~150 spoken words/min in English plus timestamps and loudness marks
   outputTokens: 14000, // adaptive thinking + up to 10 packaged clips
+  styleInputTokens: 9000, // 3 frames + words per clip + the template catalogue
+  styleOutputTokens: 3000,
+  // Romanizing Hinglish captions, measured on 8 clips: 3,543 input + 2,676 output tokens at low effort.
+  romanInputTokensPerClip: 450,
+  romanOutputTokensPerClip: 340,
   analyzeMsPerSourceMinute: 1500, // audio extract + loudness + scene/frame scan on a desktop CPU
   renderMsPerClipSecond: 450,
   avgClipSeconds: 40,
@@ -34,13 +39,25 @@ export function llmLineItem(model, usage = {}) {
 
 export function sttLineItem(model, billedSec) {
   const rate = STT_PRICING[model] ?? 0;
+  const sarvam = String(model).startsWith('sarvam:');
   return {
     stage: 'Transcription',
-    provider: 'Groq',
+    provider: sarvam ? 'Sarvam' : 'Groq',
     model,
-    detail: `${(billedSec / 60).toFixed(1)} min of audio @ $${rate}/hr`,
+    detail: `${(billedSec / 60).toFixed(1)} min of audio @ ${sarvam ? `₹${SARVAM_INR_PER_HOUR}/hr` : `$${rate}/hr`}`,
     units: { billedSec },
     usd: round6((billedSec / 3600) * rate),
+  };
+}
+
+export function alignLineItem(alignedSec) {
+  return {
+    stage: 'Word timing',
+    provider: 'ElevenLabs',
+    model: 'forced-alignment',
+    detail: `${(alignedSec / 60).toFixed(1)} min aligned @ $${ALIGN_USD_PER_HOUR}/hr`,
+    units: { alignedSec },
+    usd: round6((alignedSec / 3600) * ALIGN_USD_PER_HOUR),
   };
 }
 
@@ -95,6 +112,8 @@ function calibrated(cal) {
     inputTokensPerMinute: Math.max(50, avg((r) => (r.inputTokens - HEURISTIC.fixedInputTokens) / r.sourceMinutes)),
     outputTokens: avg((r) => r.outputTokens),
     analyzeMsPerSourceMinute: avg((r) => r.analyzeMs / r.sourceMinutes),
+    styleInputTokens: runs.some((r) => r.styleInputTokens) ? avg((r) => r.styleInputTokens || HEURISTIC.styleInputTokens) : HEURISTIC.styleInputTokens,
+    styleOutputTokens: runs.some((r) => r.styleOutputTokens) ? avg((r) => r.styleOutputTokens || HEURISTIC.styleOutputTokens) : HEURISTIC.styleOutputTokens,
     renderMsPerClipSecond: renderRuns.length ? renderRuns.reduce((a, r) => a + r.renderMs / r.renderedClipSeconds, 0) / renderRuns.length : HEURISTIC.renderMsPerClipSecond,
     avgClipSeconds: renderRuns.length ? renderRuns.reduce((a, r) => a + r.renderedClipSeconds / Math.max(1, r.clips), 0) / renderRuns.length : HEURISTIC.avgClipSeconds,
     basis: 'measured',
@@ -114,16 +133,23 @@ export function estimate({ minutes = 20, model = config.curatorModel, sttModel =
   const analyzeMs = k.analyzeMsPerSourceMinute * minutes;
   const renderMs = k.renderMsPerClipSecond * k.avgClipSeconds * clipCount;
 
+  const styleUsage = { input_tokens: Math.round(k.styleInputTokens), output_tokens: Math.round(k.styleOutputTokens) };
   const items = [
     sttLineItem(sttModel, billedSec),
+    ...(String(sttModel).startsWith('sarvam:') ? [alignLineItem(sec)] : []),
     llmLineItem(model, { input_tokens: inputTokens, output_tokens: outputTokens }),
+    { ...llmLineItem(model, styleUsage), stage: 'Styling' },
+    ...(config.captionScript === 'roman' && String(sttModel).startsWith('sarvam:')
+      ? [{ ...llmLineItem(model, { input_tokens: HEURISTIC.romanInputTokensPerClip * clipCount, output_tokens: HEURISTIC.romanOutputTokensPerClip * clipCount }), stage: 'Romanize' }]
+      : []),
     computeLineItem('Analysis', analyzeMs),
     computeLineItem('Rendering', renderMs),
   ];
   const summary = summarize(items, { sourceMinutes: minutes, clipCount });
   const compare = Object.keys(LLM_PRICING).map((m) => ({
     model: m,
-    usd: round6(items[0].usd + llmLineItem(m, { input_tokens: inputTokens, output_tokens: outputTokens }).usd),
+    usd: round6(items.filter((i) => i.provider !== 'Anthropic').reduce((a, i) => a + i.usd, 0)
+      + llmLineItem(m, { input_tokens: inputTokens, output_tokens: outputTokens }).usd + llmLineItem(m, styleUsage).usd),
   }));
   return { minutes, model, sttModel, clips: clipCount, basis: k.basis, calibrationRuns: k.runs, ...summary, compare };
 }

@@ -1,125 +1,133 @@
 # Captik Clipper
 
-One long video in, **up to ten** vertical shorts out. A local prototype of Captik's clipping model:
-paste a link (or drop a file), and an LLM curator watches the whole video, picks the moments that can
-travel on Shorts / Reels / TikTok, gives each a **virality score**, and renders them 9:16 with captions.
+One long video in, **up to ten** vertical shorts out — picked by Claude, captioned with **Captik's own
+caption templates**, and editable in **Captik's own editor**. Paste a YouTube / Google Drive / Instagram /
+TikTok / X / Facebook / LinkedIn / Vimeo link or drop a file; every clip gets a virality score and every run
+prints a cost receipt.
+
+## How it works
 
 ```
-link or file ─► Fetch ─► Listen & watch ─► Curate ─► Validate ─► Score ─► Render ─► ≤10 shorts + cost receipt
+link ──► py/fetch.py: AUDIO ONLY ──► Sarvam saaras:v3 (codemix) + ElevenLabs forced alignment
+     ──► Claude Opus 5 reads the transcript, picks ≤10 parts
+     ──► py/fetch.py: download ONLY those parts ──► align each part to the audio (10 ms)
+     ──► ffmpeg: 9:16 base per part (tracked crop / letterbox) + frames from the part
+     ──► Claude styles each clip from its frames (Captik template, colours, position, emphasis)
+     ──► Captik's KineticCaption composition renders it ──► open any clip in Captik's editor, change it, re-export
 ```
-
-## Run it
-
-Requirements: Node 22+ (built on 26.1), ffmpeg with libass on `PATH`, yt-dlp (`pip install yt-dlp`),
-an Anthropic API key and a Groq API key.
-
-```bash
-npm install
-cp .env.example .env      # add ANTHROPIC_API_KEY and GROQ_API_KEY
-npm start                 # http://localhost:4321
-npm test                  # 13 unit tests, no network
-npm run train             # re-fit the virality score from your ratings (also a button in the UI)
-```
-
-## Pipeline
 
 | Stage | What happens | Code |
 |---|---|---|
-| **Fetch** | YouTube, Google Drive, Instagram, TikTok, X, Facebook, LinkedIn, Vimeo, Reddit, Twitch, Dropbox or a direct file link. yt-dlp for platforms (≤1080p); Drive tries a direct download first, then yt-dlp. Uploads up to 8 GB. | `src/ingest.js` |
-| **Listen & watch** | 16 kHz audio → Groq Whisper with word timestamps (10-min chunks, 2 s overlap, dedupe by word start). In parallel: a loudness map (RMS per 0.5 s) and one ffmpeg pass that finds scene cuts and samples ~48 frames. | `src/media.js`, `src/transcribe.js` |
-| **Curate** | Claude Opus 5 reads the transcript, annotated with a loudness quintile (`e1`–`e5`), scene-cut marks and pauses, plus the timestamped frames. It returns structured JSON: times, title, on-screen hook, caption, hashtags, format, reasoning and seven 0–10 judgement scores. Adaptive thinking; server-side refusal fallback; if Opus is overloaded the same key falls back to Sonnet 5. | `src/curate.js`, `src/transcript.js` |
-| **Validate** | The code, not the prompt, owns the rules: **hard cap of 10 clips** (`MAX_CLIPS`), boundaries snapped to sentence edges from word timestamps, 12–90 s (long picks trimmed at a sentence end), overlapping picks dropped. | `finalizeClips` in `src/curate.js` |
-| **Score** | Virality score 0–100 = weighted mean of the curator's judgement and features measured from the audio and video (below). | `src/virality.js` |
-| **Render** | 1080×1920 H.264, loudness-normalised to −14 LUFS. Per shot: a **subject-tracking crop** when a person is on screen, a **letterbox over blurred video** for slides and screens. Word-by-word highlighted captions (Montserrat Black; Nirmala UI for Devanagari and other Indic scripts) and a boxed hook for the first 3 s. | `src/render.js`, `src/focus.js` |
+| **Get audio** | `py/fetch.py audio` (yt-dlp's Python API) pulls only a 48 kbps audio track. Uploads and sites without a separate audio stream use the local file. | `py/fetch.py`, `src/fetcher.js` |
+| **Transcribe** | Captik's production STT. Audio is cut on silence into ≤28 s chunks (Sarvam's sync limit is 30 s) and transcribed by Sarvam `saaras:v3` in `codemix` mode; ~168 s windows of that text are timed word-by-word by ElevenLabs `/v1/forced-alignment`, gated on alignment loss (retry with normalised text, split on 413, even timing as last resort). | `src/sarvamStt.js` |
+| **Pick best parts** | Claude Opus 5 reads the timestamped transcript (with loudness marks and pauses), trained by `training/`; structured JSON; the validator owns the 10-clip cap, sentence-snapped boundaries, 12–90 s and overlap removal. | `src/curate.js`, `src/llm.js` |
+| **Fetch parts** | `py/fetch.py sections` downloads only the picked ranges (HLS fragments, 3 in parallel). Each part is matched to the source audio by envelope cross-correlation — HLS ranges snap to fragment boundaries, measured up to 1.25 s off. | `py/fetch.py`, `src/align.js` |
+| **Romanize** | Sarvam writes Hindi in Devanagari; captions are converted one-for-one to romanized Hinglish the way creators type it (नहीं→nahi, बर्बाद→barbaad) — English words, names and numbers untouched, every word's timing and style kept. A clip that does not line up word-for-word keeps its original words. `CAPTION_SCRIPT=native` keeps Devanagari. | `src/romanize.js` |
+| **Frames & style** | Each part becomes a 1080×1920 base video (subject-tracking crop per shot, letterbox for slides/charts/photos, −14 LUFS). Frames from the base go to Claude with the clip's words and Captik's template catalogue; it returns template, accent/text colour, face-safe caption height, size, emphasised words and screen-shake beats — all validated. | `src/render.js`, `src/focus.js`, `src/director.js` |
+| **Score** | 0–100 virality score from the curator's judgement + measured audio/visual features. | `src/virality.js` |
+| **Render** | Captik's `KineticCaption` composition (`LambdaCaptionComposition` → `CaptionOverlay`, the component the Captik editor previews with), bundled from captik-app and rendered locally with captik-app's own `@remotion/renderer`. | `src/captikRender.js` |
+| **Edit** | `/editor/?job=…&clip=…` is Captik's editor: `TopBar`, `LeftPanel`, `VideoCanvas`, `RightPanel`, `EditorTimeline` imported from captik-app and laid out exactly as `src/app/editor/page.tsx`. Word/line edits, per-line templates, colours, position, undo, SRT; autosaves; **Export** re-renders through the same composition. | `web/`, `server.js` |
 
-Jobs run one at a time and persist to `data/jobs/<id>/` (source, transcript, frames, prompt, raw curator
-response, clips). The UI streams progress over Server-Sent Events.
+**Why audio first:** YouTube throttles single-stream downloads — the 581 MB 1080p file of a 52-minute episode
+crawled at ~270 KiB/s (≈35 min, which looks like the tool is *recording* the video). The 48 kbps audio comes down
+in 20–24 s and the nine picked parts (5:38 of video) in 138 s.
+
+## Run it
+
+Requirements: Node 22+, Python 3 with `pip install yt-dlp`, ffmpeg (with libass) on `PATH`, and a
+**captik-app checkout with `node_modules` installed** (production master; default `../Captik/captik-app`).
+
+```bash
+npm install
+cp .env.example .env        # keys, see below
+npm run build:editor        # builds Captik's editor into public/editor
+npm start                   # http://localhost:4321
+npm test                    # unit tests, no network
+```
+
+Open a finished job on the dashboard and press **Edit** on a clip to open it in the Captik editor.
 
 ## "Training" the curator
 
-Claude cannot be fine-tuned through the public API, so the prototype trains the curator in three layers:
-
-1. **`training/rubric.md`**: the training manual injected into every run. It covers hard laws (hook in 3 s, standalone, complete arc, no padding), why people share, formats that keep winning, score calibration, packaging and layout. Edit it like code.
-2. **`training/exemplars.json`**: worked pick/reject examples that teach the rubric by contrast: cold-open at the tension line, reject context-dependent clips, end on the payoff, write Hinglish in Roman script, and so on.
-3. **Your ratings.** Every ▲/▼ on a clip is stored in `data/feedback.jsonl` and
-   - is shown to the curator on the next run as *this creator's taste* (liked vs disliked picks), and
-   - trains the virality score: a logistic regression over the 12 features, L2-regularised toward the default weights so a handful of ratings can't flip the model. It reports ranking accuracy (AUC) before and after.
-
-   **Re-curate with my ratings** reruns curation on a finished job's saved transcript and frames. That costs only the LLM call, with no new download or transcription.
-
-   Verified end to end on the TED talk: after rating 3 picks ▲ and 3 ▼, re-curation returned all 3 liked moments at the top (91 / 84 / 83 with the trained weights), dropped all 3 disliked ones, and found 2 new picks, for $0.239.
+Claude cannot be fine-tuned through the public API, so the curator is trained in three layers:
+`training/rubric.md` (the manual injected into every run), `training/exemplars.json` (worked pick/reject
+examples) and **your ratings** — every ▲/▼ is shown to the curator as *this creator's taste* on the next run
+and re-fits the virality-score weights (logistic regression, L2-regularised toward the defaults). **Re-curate
+with my ratings** reuses the saved audio and transcript, so only the LLM calls and part downloads are paid again.
 
 ## Virality score
 
 | Feature | Source | Default weight |
 |---|---|---|
-| Hook, emotion, value, shareability, standalone, trend fit, payoff | Curator judgement, 0–10 each | 20 / 12 / 12 / 14 / 10 / 8 / 8 % |
-| Hook energy: loudness of the first 3 s vs the whole video | Measured | 4 % |
-| Pace: words per second | Measured | 4 % |
-| No dead air: pauses > 0.7 s | Measured | 3 % |
-| Length fit: 20–60 s sweet spot | Measured | 3 % |
-| Visual change: scene cuts per minute | Measured | 2 % |
+| Hook, emotion, value, shareability, standalone, trend fit, payoff | Curator judgement, 0–10 | 20 / 12 / 12 / 14 / 10 / 8 / 8 % |
+| Hook energy · pace · no dead air · length fit · visual change | Measured | 4 / 4 / 3 / 3 / 2 % |
 
-Tiers: **85+ Viral bet · 70+ Strong · 55+ Solid · below Long shot.** The score ranks moments *within* a video;
-it is not a view-count prediction until it has been trained on real posting results.
+Tiers: **85+ Viral bet · 70+ Strong · 55+ Solid · below Long shot.** The score ranks moments within a video; it
+is not a view-count prediction until it has been trained on real posting results.
 
-## Cost per 20-minute video (measured)
+## Cost
 
-End-to-end run through the app: a YouTube link to a 21:03 English talk (TED, 1080p, 3,707 words), with Opus 5 as curator.
-Job `20260913173117-02c2ef` produced 9 clips in 6 min 51 s: download 166 s, listen & watch 28 s, curation 109 s, render 108 s.
+End-to-end run on a real YouTube link: *India's Got Latent* S2E6 (52:26, Hinglish), Opus 5 as curator and stylist,
+job `20260913191708-cb10ec` — 9 clips in 21:39 (audio 24 s · transcribe 213 s · pick 133 s · parts 138 s · style 77 s · render 714 s).
 
 | Step | Provider | Usage | Cost |
 |---|---|---|---|
-| Transcription | Groq `whisper-large-v3` ($0.111/hr) | 1,271 s billed | $0.039 |
-| Curation | Claude Opus 5 ($5 / $25 per MTok) | 22,007 input · 8,138 output tokens (incl. thinking) | $0.313 |
-| Analysis + render | local ffmpeg | 241 s of CPU work | $0 here |
-| **Total** | | 9 clips | **$0.353** ≈ ₹31.0 |
+| Transcription | Sarvam `saaras:v3` (₹30/hr) | 52.4 min, 137 chunks | $0.298 |
+| Word timing | ElevenLabs forced alignment ($0.22/hr) | 52.4 min, 21 windows, mean loss 0.48 | $0.192 |
+| Pick best parts | Claude Opus 5 | 35,990 input · 9,334 output tokens | $0.413 |
+| Caption styling | Claude Opus 5 | 17,394 input · 1,466 output tokens (27 frames) | $0.124 |
+| Romanize captions | Claude Opus 5, low effort | 3,543 input · 2,676 output tokens (8 clips) | $0.085 |
+| Download, cut, render | yt-dlp · ffmpeg · Remotion, locally | ~830 s of CPU | $0 here (≈ $0.08 on a rented 8-vCPU box) |
+| **Total** | | 9 clips | **$1.11 (≈ ₹98)** |
 
-**→ $0.335 (≈ ₹29.5) per 20-minute video**, $0.039 per clip. A separate curation-only test on the same video
-measured 21,746 / 7,992 tokens ($0.309), so the cost is stable run to run. Using the same token counts, Sonnet 5 as curator
-would total ≈ $0.16 and Haiku 4.5 ≈ $0.10; output quality was not evaluated for those models, and their thinking token
-counts will differ. On a rented 8-vCPU box ($0.357/hr), the ffmpeg work would add $0.024.
-
-The in-app estimator starts from heuristics and recalibrates from every finished run (`data/calibration.json`).
-Expect higher token counts for Hindi and other Devanagari transcripts than for English. ₹ uses `USD_INR` from `.env` (default 88).
+**A 20-minute video with 10 clips ≈ $0.73 (≈ ₹64)** — the in-app estimator, calibrated from three real runs:
+Sarvam $0.114 + ElevenLabs $0.073 (speech scales with minutes) + curation $0.314 (mostly fixed prompt and thinking,
+plus ~590 input tokens per minute of transcript) + styling $0.121 + romanization $0.107 (both scale with the number of
+clips, not the length). It recalibrates from every finished run (`data/calibration.json`).
 
 ## Configuration (`.env`)
 
 | Variable | Default | |
 |---|---|---|
-| `ANTHROPIC_API_KEY`, `GROQ_API_KEY` | required | |
-| `PORT` | 4321 | binds 127.0.0.1 only |
-| `CURATOR_MODEL` / `CURATOR_FALLBACK_MODEL` | `claude-opus-5` / `claude-sonnet-5` | per job overridable in the UI |
-| `CURATOR_EFFORT` | `high` | `low`–`max` |
-| `STT_MODEL` | `whisper-large-v3` | or `whisper-large-v3-turbo` ($0.04/hr) |
-| `YTDLP_COOKIES_FROM_BROWSER` | empty | `chrome` / `edge` / `firefox` when Instagram or Facebook need a logged-in session |
-| `MAX_SOURCE_MINUTES` | 180 | |
-| `USD_INR` | 88 | |
-| `HOSTED_CPU_USD_PER_HOUR` | 0.357 | used for the "if hosted" line |
-| `RENDER_CONCURRENCY` | 2 | |
+| `ANTHROPIC_API_KEY` | required | curation + styling |
+| `SARVAM_API_KEY` | required | transcription |
+| `ELEVENLABS_API_KEY` | — | direct forced alignment; **or** `SUPABASE_SERVICE_ROLE_KEY` + `CAPTIK_ALIGN_URL` to use Captik's `elevenlabs-align` edge function |
+| `STT_MODEL` | `sarvam:saaras:v3` | `whisper-large-v3` (Groq, needs `GROQ_API_KEY`) as a fallback — it translates Hinglish into English |
+| `CAPTION_SCRIPT` | `roman` | `native` keeps Sarvam's Devanagari captions |
+| `CAPTIK_APP_DIR` | `../Captik/captik-app` | templates, editor components, fonts, Remotion |
+| `CURATOR_MODEL` / `CURATOR_FALLBACK_MODEL` | `claude-opus-5` / `claude-sonnet-5` | per job in the UI |
+| `SARVAM_INR_PER_HOUR` / `ELEVENLABS_ALIGN_USD_PER_HOUR` | 30 / 0.22 | list prices used on receipts |
+| `MAX_DOWNLOAD_HEIGHT` | 1080 | part resolution |
+| `YTDLP_COOKIES_FROM_BROWSER` | — | `chrome` / `edge` / `firefox` when Instagram or Facebook need a login |
+| `PORT` · `USD_INR` · `MAX_SOURCE_MINUTES` · `RENDER_CONCURRENCY` | 4321 · 88 · 180 · 2 | |
 
 ## Known limits
 
-- **Subject tracking is a heuristic** (YCbCr skin tone + motion + edges, cut detection by histogram spikes), not face detection. A shot is cropped only when skin-toned pixels also *move*; static skin-coloured graphics (orange chart bars) and still photos letterbox instead. It is verified on stage, close-up, chart-slide and photo footage. Lighting that pushes skin outside the colour range, or a wide two-person podcast shot, can pick the wrong region. There is no active-speaker detection yet.
-- Instagram and Facebook often require cookies (see above). Private Drive files need "Anyone with the link".
-- Groq's free tier caps audio per hour/day; long videos may hit rate limits (the client retries 429s).
-- No auth, no queue persistence across restarts (running jobs are marked failed on restart).
+- The Captik bundle is cached per captik-app **commit** in `data/captik-bundle/`; uncommitted template changes need that folder deleted.
+- Jobs from before romanization convert with `POST /api/jobs/<id>/romanize` (re-renders the changed clips).
+- Local rendering takes roughly 1.5–2× each clip's length on a 16-core laptop (plus ~2 minutes of one-time bundling).
+- Subject tracking is a heuristic (skin tone that also moves, histogram-spike cut detection), not face detection.
+- No auth; binds 127.0.0.1. Jobs run one at a time; editor re-renders queue separately.
 
 ## Repo layout
 
 ```
-server.js            Express API + static UI
-src/ingest.js        link detection and download
-src/media.js         probe, audio, loudness, scene/frame scan
-src/transcribe.js    Groq Whisper, chunked, word timestamps
-src/transcript.js    phrases, curator transcript format, sentence snapping
-src/curate.js        prompt, Claude call, structured output, validator (10-clip cap)
-src/virality.js      features, score, tiers, training
+server.js            Express API, dashboard, editor, media
+py/fetch.py          yt-dlp Python API: audio-only and section downloads, JSON-line progress
+src/fetcher.js       runs fetch.py
+src/sarvamStt.js     silence chunking, Sarvam, ElevenLabs forced alignment
+src/transcribe.js    Groq Whisper fallback
+src/curate.js        curator prompt + validator (10-clip cap)
+src/align.js         part ↔ source audio alignment
+src/render.js        9:16 base videos (tracked crop / letterbox)
 src/focus.js         subject tracking, cut detection, per-shot layout
-src/render.js        9:16 filter graphs, ASS captions, encode
-src/cost.js          receipts, 20-minute estimator, calibration
-src/pipeline.js      stage orchestration
-public/              UI (vanilla JS, no build step)
+src/director.js      caption styling from frames with Captik's template catalogue
+src/segments.js      Captik's caption line builder (ported from the editor)
+src/captikRender.js  Captik composition bundle + render, editor-state sanitising
+src/pipeline.js      stages, re-render queue
+src/virality.js      score, training      src/cost.js   receipts, estimator
+web/                 Captik editor app (Vite, components from captik-app)
+public/              dashboard
 training/            rubric, exemplars, train CLI
-test/                unit tests (node:test)
+test/                node:test
 ```

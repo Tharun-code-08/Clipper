@@ -13,6 +13,7 @@ const LABELS = {
   'claude-opus-5': 'Claude Opus 5',
   'claude-sonnet-5': 'Claude Sonnet 5',
   'claude-haiku-4-5': 'Claude Haiku 4.5',
+  'sarvam:saaras:v3': 'Sarvam + ElevenLabs',
   'whisper-large-v3': 'Whisper large-v3',
   'whisper-large-v3-turbo': 'Whisper v3 turbo',
 };
@@ -376,6 +377,15 @@ function updateClip(el, clip, job, features) {
       const shown = f.source === 'llm' ? Math.round(v * 10) : Math.round(v * 100);
       return `<div class="bar-row ${f.source === 'measured' ? 'measured' : ''}" title="${esc(f.hint)}"><span>${esc(f.label)}</span><b>${shown}</b><span class="track"><i style="width:${v * 100}%"></i></span></div>`;
     }).join('') + '<div class="bars-legend"><span>curator judgement /10</span><span class="m">measured from audio &amp; video /100</span></div>';
+  }
+
+  const edit = el.querySelector('.edit');
+  if (clip.edit && clip.base) {
+    edit.href = `/editor/?job=${encodeURIComponent(job.id)}&clip=${encodeURIComponent(clip.id)}`;
+    edit.hidden = false;
+  } else {
+    edit.removeAttribute('href');
+    edit.hidden = true;
   }
 
   const media = el.querySelector('.clip-media');

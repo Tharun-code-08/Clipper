@@ -139,7 +139,11 @@ test('taste block lists liked and disliked picks', () => {
 test('cost estimate for a 20-minute video is itemised and model-sensitive', () => {
   const est = estimate({ minutes: 20 });
   assert.ok(est.usd > 0);
-  assert.equal(est.items.length, 4);
+  assert.ok(est.items.some((i) => i.stage === 'Curation') && est.items.some((i) => i.stage === 'Styling'));
+  const sarvam = estimate({ minutes: 20, sttModel: 'sarvam:saaras:v3' });
+  assert.ok(sarvam.items.some((i) => i.provider === 'Sarvam') && sarvam.items.some((i) => i.provider === 'ElevenLabs'));
+  const groq = estimate({ minutes: 20, sttModel: 'whisper-large-v3' });
+  assert.ok(!groq.items.some((i) => i.provider === 'ElevenLabs'));
   const opus = est.compare.find((c) => c.model === 'claude-opus-5').usd;
   const sonnet = est.compare.find((c) => c.model === 'claude-sonnet-5').usd;
   assert.ok(opus > sonnet);

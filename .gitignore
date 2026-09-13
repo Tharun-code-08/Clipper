@@ -3,3 +3,4 @@ data/
 .env
 *.log
 training/weights.json
+public/editor/

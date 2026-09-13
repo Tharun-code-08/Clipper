@@ -1,13 +1,15 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import Anthropic from '@anthropic-ai/sdk';
-import { config, TRAINING_DIR, MAX_CLIPS, CLIP_MIN_SEC, CLIP_MAX_SEC } from './config.js';
+import { TRAINING_DIR, MAX_CLIPS, CLIP_MIN_SEC, CLIP_MAX_SEC } from './config.js';
+import { callStructured } from './llm.js';
 import { clamp, fmtTime } from './util.js';
 import { snapStart, snapEnd, textBetween, isEndBoundary } from './transcript.js';
 import { FEATURES } from './virality.js';
 
 const JUDGEMENT_KEYS = FEATURES.filter((f) => f.source === 'llm').map((f) => f.key);
 
+// Curation only picks moments and packages them. Framing and caption styling happen later, from
+// frames of the picked parts (see director.js), so the curator never needs the video itself.
 export const CLIP_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -21,7 +23,7 @@ export const CLIP_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['start', 'end', 'title', 'hook_text', 'caption', 'hashtags', 'format', 'why', 'first_words', 'last_words', 'layout', 'focus_x', 'scores'],
+        required: ['start', 'end', 'title', 'hook_text', 'caption', 'hashtags', 'format', 'why', 'scores'],
         properties: {
           start: { type: 'number', description: 'Seconds. Timestamp of the hook line from the transcript.' },
           end: { type: 'number', description: 'Seconds. End of the payoff sentence.' },
@@ -31,10 +33,6 @@ export const CLIP_SCHEMA = {
           hashtags: { type: 'array', items: { type: 'string' } },
           format: { type: 'string', description: 'Which winning format from the rubric this clip is.' },
           why: { type: 'string', description: 'Why it will perform: 1-2 specific sentences.' },
-          first_words: { type: 'string', description: 'First ~6 spoken words of the clip, verbatim.' },
-          last_words: { type: 'string', description: 'Last ~6 spoken words of the clip, verbatim.' },
-          layout: { type: 'string', enum: ['crop', 'fit'] },
-          focus_x: { type: 'number', description: '0 = left edge, 1 = right edge; subject centre for crop.' },
           scores: {
             type: 'object',
             additionalProperties: false,
@@ -48,10 +46,10 @@ export const CLIP_SCHEMA = {
 };
 
 const ROLE = `You are Captik Clipper, the curator inside a short-form video clipping engine.
-You "watch" a long-form video through its timestamped transcript, loudness marks, scene cuts and sampled frames,
-and you choose the moments that will perform as vertical shorts on YouTube Shorts, Instagram Reels and TikTok.
+You read a long-form video through its timestamped transcript, loudness marks and pauses, and you choose the
+moments that will perform as vertical shorts on YouTube Shorts, Instagram Reels and TikTok.
 You have the judgement of a top clipping editor: you would rather return 3 great clips than 10 average ones.
-Your picks are cut and rendered automatically, so timestamps must come from the transcript and packaging must be ready to post.`;
+Only the parts you pick get downloaded and edited, so timestamps must come from the transcript and packaging must be ready to post.`;
 
 async function loadTraining() {
   const rubric = await fs.readFile(path.join(TRAINING_DIR, 'rubric.md'), 'utf8');
@@ -76,107 +74,37 @@ export function tasteBlock(feedback = []) {
   ].filter(Boolean).join('\n\n');
 }
 
-export async function buildPrompt({ meta, transcriptText, frames, frameEvery, jobDir, maxClips, feedback }) {
+export async function buildPrompt({ meta, transcriptText, maxClips, feedback }) {
   const { rubric, examples } = await loadTraining();
   const taste = tasteBlock(feedback);
-  const system = [
-    ROLE,
-    `# TRAINING MANUAL\n${rubric}`,
-    `# WORKED EXAMPLES\n${examples}`,
-    taste && `# ${taste}`,
-  ].filter(Boolean).join('\n\n');
-
+  const system = [ROLE, `# TRAINING MANUAL\n${rubric}`, `# WORKED EXAMPLES\n${examples}`, taste && `# ${taste}`]
+    .filter(Boolean)
+    .join('\n\n');
   const header = [
     `VIDEO: "${meta.title}"${meta.uploader ? ` by ${meta.uploader}` : ''}`,
-    `Source: ${meta.platform} · duration ${fmtTime(meta.duration)} (${meta.duration.toFixed(1)} s) · ${meta.width}x${meta.height} · detected language: ${meta.language || 'unknown'}`,
+    `Source: ${meta.platform} · duration ${fmtTime(meta.duration)} (${meta.duration.toFixed(1)} s) · detected language: ${meta.language || 'unknown'}`,
     meta.description ? `Description: ${meta.description.slice(0, 600)}` : '',
   ].filter(Boolean).join('\n');
+  const task = `${header}
 
-  const content = [{ type: 'text', text: `${header}\n\nFRAMES — one every ${frameEvery} s, each labelled with its timestamp. Use the frames nearest a clip to choose layout and focus_x.` }];
-  for (const f of frames) {
-    const data = await fs.readFile(path.join(jobDir, f.file));
-    content.push({ type: 'text', text: `t=${f.t}s` });
-    content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: data.toString('base64') } });
-  }
-  const task = `TRANSCRIPT — format: [start_seconds eLOUDNESS] text · e1 quiet … e5 loudest quintile of this video · ✂ = scene/camera cut since the previous line · (pause Ns) = silence.
+TRANSCRIPT — format: [start_seconds eLOUDNESS] text · e1 quiet … e5 loudest quintile of this video · (pause Ns) = silence.
 
 ${transcriptText}
 
 TASK: Pick up to ${maxClips} clips (the engine hard-caps at ${MAX_CLIPS}). Rank them best-first.
 Before answering, review every pick against the hard laws in section 1 of the manual and delete any that fail — returning fewer clips is correct when the video has fewer great moments.
 start/end must be transcript timestamps; clip length ${CLIP_MIN_SEC}-${CLIP_MAX_SEC} s, ideally 20-60 s.`;
-  content.push({ type: 'text', text: task });
-  return { system, content, debugText: `${system}\n\n=== USER ===\n${header}\n[${frames.length} frames]\n\n${task}` };
+  return { system, content: [{ type: 'text', text: task }], debugText: `${system}\n\n=== USER ===\n${task}` };
 }
 
-let client;
-const anthropic = () => (client ||= new Anthropic({ apiKey: config.anthropicKey, maxRetries: 2, timeout: 15 * 60 * 1000 }));
-
-const supportsServerFallback = (model) => /^claude-(opus-5|fable-5)/.test(model);
-
-async function callOnce(model, { system, content }, onProgress) {
-  const params = {
-    model,
-    max_tokens: 32000,
-    thinking: { type: 'adaptive' },
-    output_config: { effort: config.curatorEffort, format: { type: 'json_schema', schema: CLIP_SCHEMA } },
-    system,
-    messages: [{ role: 'user', content }],
-  };
-  if (supportsServerFallback(model)) Object.assign(params, { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' });
-  const stream = anthropic().beta.messages.stream(params);
-  let phase = 'reading';
-  let chars = 0;
-  stream.on('streamEvent', (event) => {
-    if (event.type === 'content_block_start') {
-      phase = event.content_block.type === 'thinking' ? 'thinking' : event.content_block.type === 'text' ? 'writing' : phase;
-      onProgress?.({ phase, chars });
-    } else if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-      chars += event.delta.text.length;
-      onProgress?.({ phase: 'writing', chars });
-    }
-  });
-  return stream.finalMessage();
-}
-
-/** Call the curator, laddering to the fallback model when the primary is overloaded or down. */
-export async function callCurator(prompt, { model, onProgress } = {}) {
-  if (!config.anthropicKey) throw new Error('ANTHROPIC_API_KEY is missing from .env');
-  const ladder = [...new Set([model || config.curatorModel, config.curatorFallbackModel].filter(Boolean))];
-  let lastErr;
-  for (const model of ladder) {
-    try {
-      const started = Date.now();
-      const msg = await callOnce(model, prompt, onProgress);
-      return { msg, requestedModel: model, ms: Date.now() - started };
-    } catch (err) {
-      lastErr = err;
-      const retryable = err instanceof Anthropic.APIConnectionError
-        || (err instanceof Anthropic.APIError && (err.status === 429 || err.status >= 500));
-      if (!retryable) break;
-    }
-  }
-  if (lastErr instanceof Anthropic.APIError) throw new Error(`Curator model failed (HTTP ${lastErr.status}): ${lastErr.message}`);
-  throw lastErr;
-}
-
-export function parseCuratorMessage(msg) {
-  if (msg.stop_reason === 'refusal') {
-    throw new Error(`The curator declined this video${msg.stop_details?.explanation ? `: ${msg.stop_details.explanation}` : '.'}`);
-  }
-  const text = msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
-  try {
-    return JSON.parse(text);
-  } catch {
-    if (msg.stop_reason === 'max_tokens') throw new Error('The curator ran out of output tokens before finishing. Try again or lower CURATOR_EFFORT.');
-    throw new Error('The curator returned malformed JSON.');
-  }
-}
+/** Resolves {data, msg, model, ms}. */
+export const callCurator = (prompt, { model, onProgress } = {}) =>
+  callStructured({ system: prompt.system, content: prompt.content, schema: CLIP_SCHEMA, model, onProgress });
 
 const normTag = (t) => `#${String(t).replace(/^#+/, '').replace(/[^\p{L}\p{N}_]/gu, '')}`;
 
 /**
- * Turn raw curator picks into render-ready clips. The validator, not the prompt, owns the rules:
+ * Turn raw curator picks into clips. The validator, not the prompt, owns the rules:
  * ≤ maxClips (never above MAX_CLIPS), sentence-snapped boundaries, 12-90 s, no heavy overlaps.
  */
 export function finalizeClips(rawClips, { words, duration, maxClips = MAX_CLIPS }) {
@@ -217,8 +145,8 @@ export function finalizeClips(rawClips, { words, duration, maxClips = MAX_CLIPS 
       hashtags: [...new Set((c.hashtags || []).map(normTag).filter((t) => t.length > 1))].slice(0, 6),
       format: String(c.format || '').trim().slice(0, 60),
       why: String(c.why || '').trim().slice(0, 400),
-      layout: c.layout === 'fit' ? 'fit' : 'crop',
-      focusX: clamp(Number.isFinite(Number(c.focus_x)) ? Number(c.focus_x) : 0.5, 0, 1),
+      layout: 'crop',
+      focusX: 0.5,
       scores,
       transcript: textBetween(words, start, end),
     });

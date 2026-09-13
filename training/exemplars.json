@@ -1,0 +1,58 @@
+{
+  "note": "Hand-written seed examples that teach the curator the rubric by contrast. They are illustrative, not real performance data. Add your own real wins and misses here; thumbs-up/down in the app are injected automatically on top of these.",
+  "examples": [
+    {
+      "lesson": "Cold-open at the tension line, not the setup",
+      "transcript": "[410.2 e2] So I'd been working there for about three years, [414.0 e2] pretty normal job, nothing special. [417.5 e4] Then my manager calls me in and says: you have until Friday. [421.3 e4] I had forty thousand rupees in the bank. [424.0 e3] That Friday changed everything, because I finally started the business.",
+      "verdict": "pick",
+      "start": 417.5,
+      "why": "Starting at 410 spends 7 seconds on a flat setup. 'You have until Friday' is stakes in one line; the money figure raises them and the last line pays off. Start at 417.5, end after 'started the business'."
+    },
+    {
+      "lesson": "Reject clips that lean on earlier context",
+      "transcript": "[902.0 e3] And that's exactly why what he said earlier is wrong. [905.4 e3] Because if you think about the second point I made, [908.9 e2] it just doesn't add up.",
+      "verdict": "reject",
+      "why": "'What he said earlier' and 'the second point I made' point outside the clip. A cold viewer has nothing to hold. Standalone would be 2/10."
+    },
+    {
+      "lesson": "A host question without its answer is not a clip",
+      "transcript": "[120.0 e3] What's the one habit that made you rich? [123.1 e2] Hmm. Let me think. [126.5 e2] You know, it's complicated, there are many things...",
+      "verdict": "reject",
+      "why": "The question is a great hook but the payoff never arrives inside the window. Only pick it if the actual answer lands within ~60 s; then end on the answer."
+    },
+    {
+      "lesson": "End on the payoff, cut the trailing filler",
+      "transcript": "[1310.0 e4] Nobody tells you this: the first ten thousand followers are the slowest. [1314.2 e3] The next ninety thousand came in four months. [1318.0 e4] Consistency beats talent, every single time. [1321.6 e1] Yeah. So, uh, anyway, what were we talking about?",
+      "verdict": "pick",
+      "start": 1310.0,
+      "why": "Opens on an insider-reveal hook with a number, escalates with a second number, lands on a quotable moral. End right after 'every single time' (≈1321.4) — the 1321.6 line is dead air that kills the loop."
+    },
+    {
+      "lesson": "Specific numbers beat vague claims",
+      "transcript": "[640.3 e3] I tested sleeping five hours versus eight hours for thirty days. [644.8 e4] On five hours my reaction time dropped by almost a third. [649.0 e4] I thought I was being productive. I was actually slower at everything.",
+      "verdict": "pick",
+      "start": 640.3,
+      "why": "Experiment framing plus a concrete result is practical value and a pattern break (less sleep = slower). Score value 8, trend 7 (health science), payoff 8."
+    },
+    {
+      "lesson": "Hinglish is packaged in Roman script",
+      "transcript": "[233.0 e4] Log bolte hain 25 ki age mein settle ho jao. [236.4 e4] Main bolta hoon 25 mein risk lo, 35 mein settle hona. [240.1 e3] Kyunki 25 pe ghar pe koi EMI nahi hai, koi responsibility nahi hai.",
+      "verdict": "pick",
+      "start": 233.0,
+      "why": "Contrarian career take aimed at an identity (people in their 20s) — comments will argue. Title in natural Roman Hinglish: '25 mein settle mat ho, risk lo'. hook_text adds a frame instead of repeating: 'Unpopular career advice'."
+    },
+    {
+      "lesson": "Two clips on the same idea: keep only the stronger",
+      "transcript": "[300.0 e3] Consistency matters more than motivation. ... [1200.0 e5] I posted every day for 400 days and the first 200 got nothing. Then one video did 9 million.",
+      "verdict": "pick",
+      "start": 1200.0,
+      "why": "Both moments say 'consistency wins'. The 1200 story proves it with numbers and a twist; the 300 line only asserts it. Return the 1200 clip, drop the other."
+    },
+    {
+      "lesson": "Loud is not the same as good",
+      "transcript": "[75.0 e5] WOW! Okay okay okay. [77.2 e5] Hahaha, no way, no way. [79.5 e4] Anyway, let's get back to the topic.",
+      "verdict": "reject",
+      "why": "High energy but no content and no reason for the reaction inside the clip. A reaction is only a clip when the viewer sees or hears what caused it."
+    }
+  ]
+}

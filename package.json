@@ -1,0 +1,19 @@
+{
+  "name": "captik-clipper",
+  "version": "0.1.0",
+  "description": "Captik Clipper - LLM-curated viral shorts from long-form video",
+  "main": "server.js",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\"",
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --watch --env-file-if-exists=.env server.js",
+    "train": "node --env-file-if-exists=.env training/train.js"
+  },
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.125.0",
+    "express": "^5.2.1",
+    "multer": "^2.3.0"
+  }
+}

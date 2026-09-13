@@ -8,16 +8,25 @@
     "start": "node --env-file-if-exists=.env server.js",
     "dev": "node --watch-path=server.js --watch-path=src --env-file-if-exists=.env server.js",
     "train": "node --env-file-if-exists=.env training/train.js",
-    "build:editor": "vite build --config web/vite.config.mjs"
+    "build:editor": "vite build --config web/vite.config.mjs",
+    "sync:captik": "node scripts/sync-captik.mjs"
   },
   "license": "ISC",
   "type": "module",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.125.0",
+    "@remotion/bundler": "4.0.470",
+    "@remotion/media": "4.0.470",
+    "@remotion/media-parser": "4.0.470",
+    "@remotion/renderer": "4.0.470",
+    "@remotion/web-renderer": "4.0.470",
     "express": "^5.2.1",
+    "framer-motion": "12.39.0",
+    "lucide-react": "1.16.0",
     "multer": "^2.3.0",
     "react": "^19.2.4",
-    "react-dom": "^19.2.4"
+    "react-dom": "^19.2.4",
+    "remotion": "4.0.470"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

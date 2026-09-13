@@ -363,7 +363,7 @@ function updateClip(el, clip, job, features) {
   score.querySelector('span').textContent = clip.tier || '';
   score.className = `clip-score ${clip.score >= 70 ? '' : clip.score >= 55 ? 't-solid' : 't-long'}`;
   el.querySelector('.clip-title').textContent = clip.title;
-  el.querySelector('.clip-meta').innerHTML = `${fmtTime(clip.start)} → ${fmtTime(clip.end)} · ${clip.duration} s · ${esc(clip.format)} <em>· ${({ fit: 'letterbox', mixed: 'crop + letterbox', crop: 'tracked crop' })[clip.layout] || clip.layout}</em>`;
+  el.querySelector('.clip-meta').innerHTML = `${fmtTime(clip.start)} → ${fmtTime(clip.end)} · ${clip.duration} s · ${esc(clip.format)} <em>· ${({ fit: 'letterbox', mixed: 'crop + letterbox', crop: 'tracked crop' })[clip.layout] || clip.layout}</em>${clip.dirty ? ' <em>· edited, export from the editor to update</em>' : ''}`;
   el.querySelector('.clip-hook').textContent = clip.hookText;
   el.querySelector('.clip-why').textContent = clip.why;
   el.querySelector('.clip-caption').textContent = clip.caption;
@@ -393,7 +393,7 @@ function updateClip(el, clip, job, features) {
   let overlay = media.querySelector('.clip-pending');
   if (clip.status === 'done') {
     overlay?.remove();
-    const src = `/media/${job.id}/${clip.file}`;
+    const src = `/media/${job.id}/${clip.file}?v=${encodeURIComponent(clip.renderedAt || '')}`;
     if (video.dataset.src !== src) {
       video.dataset.src = src;
       video.poster = `/media/${job.id}/${clip.poster}`;

@@ -2,24 +2,26 @@ import path from 'node:path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
+import { CAPTIK_DIR, CAPTIK_SRC, SHIMS } from '../captik/paths.mjs';
 
-// The editor UI is Captik's own editor: TopBar, LeftPanel, VideoCanvas, RightPanel, EditorTimeline
-// and the caption templates are imported straight from the captik-app checkout (production master),
-// so the clipper can never drift from what captik.in ships.
-export const CAPTIK_APP_DIR = path.resolve(process.env.CAPTIK_APP_DIR || path.join(import.meta.dirname, '../../Captik/captik-app'));
+const posix = (p) => p.split(path.sep).join('/');
+const exact = (spec) => new RegExp(`^${spec.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`);
 
+// The studio is built from Captik's own editor components and caption templates, vendored unchanged in
+// captik/src (scripts/sync-captik.mjs), so `@/…` resolves exactly as it does inside captik-app.
 export default defineConfig({
   root: import.meta.dirname,
   base: '/editor/',
   plugins: [react(), tailwindcss()],
   resolve: {
-    alias: [{ find: /^@\//, replacement: `${path.join(CAPTIK_APP_DIR, 'src').split(path.sep).join('/')}/` }],
-    // captik-app files resolve packages from captik-app/node_modules; React must be ONE copy for
-    // hooks to work, so it is pinned to the clipper's install (same version as captik-app).
+    alias: [
+      ...Object.entries(SHIMS).map(([spec, file]) => ({ find: exact(spec), replacement: posix(file) })),
+      { find: /^@\//, replacement: `${posix(CAPTIK_SRC)}/` },
+    ],
     dedupe: ['react', 'react-dom'],
   },
-  server: { fs: { allow: [path.join(import.meta.dirname, '..'), CAPTIK_APP_DIR] } },
-  // Captik's fonts are served by the Express server straight from captik-app/public, not copied.
+  server: { fs: { allow: [path.join(import.meta.dirname, '..'), CAPTIK_DIR] } },
+  // Fonts are served by Express from captik/public/fonts at /fonts, the URL Captik's stylesheet uses.
   publicDir: false,
   build: {
     outDir: path.join(import.meta.dirname, '../public/editor'),

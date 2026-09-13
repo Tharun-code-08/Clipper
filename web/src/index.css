@@ -1,9 +1,9 @@
 /* Captik's global stylesheet: Tailwind v4, every caption font's @font-face, theme tokens. */
-@import "../../../Captik/captik-app/src/app/globals.css";
+@import "../../captik/src/app/globals.css";
 
 /* Generate the utility classes Captik's editor components use. */
-@source "../../../Captik/captik-app/src/components";
-@source "../../../Captik/captik-app/src/lib";
+@source "../../captik/src/components";
+@source "../../captik/src/lib";
 @source "./";
 
 /* next/font sets these variables in captik-app's root layout; here Geist comes from Google Fonts. */

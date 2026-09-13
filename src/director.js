@@ -1,12 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { CAPTIK_APP_DIR } from './config.js';
+import { CAPTIK_SRC } from './config.js';
 import { callStructured } from './llm.js';
 import { clamp } from './util.js';
 
 /** Production master's caption templates, read straight from captik-app's catalogue. */
 export async function loadTemplateCatalog() {
-  const src = await fs.readFile(path.join(CAPTIK_APP_DIR, 'src', 'lib', 'captionStyles.tsx'), 'utf8');
+  const src = await fs.readFile(path.join(CAPTIK_SRC, 'lib', 'captionStyles.tsx'), 'utf8');
   const re = /id: '([a-z0-9_]+)', name: '([^']+)'(?:, badge: '([^']+)')?, tags: \[([^\]]*)\]/g;
   return [...src.matchAll(re)].map((m) => ({
     id: m[1],

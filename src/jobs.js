@@ -55,6 +55,7 @@ export async function getJob(id, { raw = false } = {}) {
   if (live.has(id)) return live.get(id);
   const job = await readJson(path.join(jobDir(id), 'job.json'));
   if (!job) return null;
+  settleClips(job);
   if (raw) {
     live.set(id, job);
     return job;
@@ -82,6 +83,16 @@ export async function listJobs() {
       topScore: j.clips.reduce((m, c) => Math.max(m, c.score || 0), 0) || null,
       costUsd: j.cost?.usd ?? null,
     }));
+}
+
+/** A trim or export that was running when the server stopped did not finish: show the clip as it was. */
+function settleClips(job) {
+  for (const c of job.clips || []) {
+    if (c.status !== 'trimming' && c.status !== 'rendering' && c.status !== 'queued') continue;
+    c.status = c.file ? 'done' : 'error';
+    if (!c.file) c.error ||= 'The server restarted before this clip finished rendering.';
+    if (c.trim) c.trim = { ...c.trim, stage: null, progress: 0 };
+  }
 }
 
 export const emit = (job) => bus.emit(job.id, job);

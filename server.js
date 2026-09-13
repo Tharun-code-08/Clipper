@@ -2,9 +2,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import express from 'express';
 import multer from 'multer';
-import { config, ROOT, DATA_DIR, JOBS_DIR, MAX_CLIPS, LLM_PRICING, STT_PRICING, CAPTIK_APP_DIR } from './src/config.js';
+import { config, ROOT, DATA_DIR, JOBS_DIR, MAX_CLIPS, LLM_PRICING, STT_PRICING, CAPTIK_FONTS } from './src/config.js';
 import { createJob, getJob, listJobs, saveJob, jobDir, bus, STAGES, logLine } from './src/jobs.js';
-import { enqueue, resumeQueued, queueRerender } from './src/pipeline.js';
+import { enqueue, resumeQueued, queueRerender, startTrim, trimSource } from './src/pipeline.js';
 import { sanitizeEdit } from './src/captikRender.js';
 import { romanizeClips, needsRoman } from './src/romanize.js';
 import { llmLineItem, summarize } from './src/cost.js';
@@ -23,7 +23,7 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(ROOT, 'public')));
 // Captik's fonts first (the editor + templates reference /fonts/*), then the clipper's own.
-app.use('/fonts', express.static(path.join(CAPTIK_APP_DIR, 'public', 'fonts')));
+app.use('/fonts', express.static(CAPTIK_FONTS));
 app.use('/fonts', express.static(path.join(ROOT, 'assets', 'fonts')));
 app.use('/media', express.static(JOBS_DIR));
 
@@ -88,12 +88,18 @@ app.get('/api/templates', async (_req, res, next) => {
   try { res.json(await loadTemplateCatalog()); } catch (err) { next(err); }
 });
 
+// The editor sends the trim revision it loaded; an edit made before a trim must not overwrite the re-timed captions.
+const staleTrim = (clip, body) => body?.trimRev !== undefined && (body.trimRev ?? null) !== (clip.trim?.trimmedAt ?? null);
+const TRIMMED = { error: 'This clip was trimmed after the editor loaded it. Reload to keep editing.', code: 'trimmed' };
+
 // The editor saves a clip's Captik state (words, lines, template, colours, position) here.
 app.put('/api/jobs/:id/clips/:clipId/edit', async (req, res, next) => {
   try {
     const job = await getJob(req.params.id, { raw: true });
     const clip = job?.clips.find((c) => c.id === req.params.clipId);
     if (!clip?.edit) return res.status(404).json({ error: 'Clip not found or not styled yet' });
+    if (clip.status === 'trimming') return res.status(409).json({ error: 'This clip is being trimmed; the editor reloads it when the trim is done.' });
+    if (staleTrim(clip, req.body)) return res.status(409).json(TRIMMED);
     clip.edit = sanitizeEdit(req.body?.edit, clip.edit);
     clip.dirty = true;
     await saveJob(job);
@@ -134,12 +140,43 @@ app.post('/api/jobs/:id/romanize', async (req, res, next) => {
   }
 });
 
+// The trim track: source words, loudness and downloaded video around a clip (?context= seconds each side).
+app.get('/api/jobs/:id/clips/:clipId/source', async (req, res, next) => {
+  try {
+    const job = await getJob(req.params.id, { raw: true });
+    const clip = job?.clips.find((c) => c.id === req.params.clipId);
+    if (!clip?.edit || !job.source) return res.status(404).json({ error: 'Clip not found or not ready' });
+    res.json(await trimSource(job, clip, { contextSec: req.query.context }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Trim a clip to new in/out points (source seconds). Re-cuts the 9:16 base — downloading more video when the
+// range reaches past the part — re-times the captions keeping every edit, and re-scores. Progress arrives over SSE.
+app.post('/api/jobs/:id/clips/:clipId/trim', async (req, res, next) => {
+  try {
+    const job = await getJob(req.params.id, { raw: true });
+    const clip = job?.clips.find((c) => c.id === req.params.clipId);
+    if (!clip?.edit || !clip.base || !job.source) return res.status(404).json({ error: 'Clip not found or not ready to trim' });
+    if (job.status === 'running' || job.status === 'queued') return res.status(409).json({ error: 'Wait for the job to finish first' });
+    if (staleTrim(clip, req.body)) return res.status(409).json(TRIMMED);
+    if (req.body?.edit && clip.status !== 'trimming') clip.edit = sanitizeEdit(req.body.edit, clip.edit);
+    const range = await startTrim(job, clip, { start: req.body?.start, end: req.body?.end });
+    res.status(202).json({ ok: true, ...range });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Export from the editor: save the state (if sent) and re-render through Captik's composition.
 app.post('/api/jobs/:id/clips/:clipId/render', async (req, res, next) => {
   try {
     const job = await getJob(req.params.id, { raw: true });
     const clip = job?.clips.find((c) => c.id === req.params.clipId);
     if (!clip?.base || !clip.edit) return res.status(404).json({ error: 'Clip not found or not ready to render' });
+    if (clip.status === 'trimming') return res.status(409).json({ error: 'Wait for the trim to finish before exporting.' });
+    if (staleTrim(clip, req.body)) return res.status(409).json(TRIMMED);
     if (req.body?.edit) clip.edit = sanitizeEdit(req.body.edit, clip.edit);
     Object.assign(clip, { status: 'queued', progress: 0 });
     await saveJob(job);

@@ -4,36 +4,55 @@ import fsp from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { CAPTIK_APP_DIR, DATA_DIR } from './config.js';
-import { run } from './util.js';
+import { CAPTIK_DIR, CAPTIK_SRC, SHIMS, DATA_DIR } from './config.js';
 
-// Remotion comes from the captik-app checkout, so the clipper renders with exactly the versions
-// (and the KineticCaption composition) that production master's Lambda / render worker use.
-const captikRequire = createRequire(path.join(CAPTIK_APP_DIR, 'package.json'));
+// Remotion is pinned to the exact version captik-app ships (captik/UPSTREAM.json), and the composition is
+// Captik's own KineticCaption from captik/src — the one production's Lambda / render worker use.
+const require = createRequire(import.meta.url);
 export const COMPOSITION_ID = 'KineticCaption';
 
 let bundling = null;
 
-async function captikRevision() {
-  const r = await run('git', ['-C', CAPTIK_APP_DIR, 'rev-parse', '--short=12', 'HEAD']).catch(() => null);
-  return r?.code === 0 ? r.stdout.trim() : 'working-tree';
+/** Content hash of the vendored Captik sources + shims: a re-sync or a shim change rebuilds the bundle. */
+function captikFingerprint() {
+  const hash = crypto.createHash('sha256');
+  for (const dir of [CAPTIK_SRC, path.join(CAPTIK_DIR, 'shims')]) {
+    const files = fs.readdirSync(dir, { recursive: true }).map(String).sort();
+    for (const f of files) {
+      const abs = path.join(dir, f);
+      if (!fs.statSync(abs).isFile()) continue;
+      hash.update(f.split(path.sep).join('/'));
+      hash.update(fs.readFileSync(abs));
+    }
+  }
+  return hash.digest('hex').slice(0, 12);
 }
 
-/** Bundle captik-app's src/remotion once per commit. Returns the local serveUrl (a directory). */
+/** Bundle Captik's src/remotion once per version of the vendored sources. Returns the local serveUrl (a directory). */
 export function ensureBundle() {
   bundling ||= (async () => {
-    const rev = await captikRevision();
+    const rev = captikFingerprint();
     const outDir = path.join(DATA_DIR, 'captik-bundle', rev);
     if (fs.existsSync(path.join(outDir, 'index.html'))) return outDir;
     // Always a fresh directory: re-copying public/ over an existing bundle fails with EPERM on OneDrive.
     const tmp = `${outDir}.tmp-${Date.now()}`;
-    const { bundle } = captikRequire('@remotion/bundler');
+    const { bundle } = require('@remotion/bundler');
     await bundle({
-      entryPoint: path.join(CAPTIK_APP_DIR, 'src', 'remotion', 'index.tsx'),
-      publicDir: path.join(CAPTIK_APP_DIR, 'public'),
+      entryPoint: path.join(CAPTIK_SRC, 'remotion', 'index.tsx'),
+      publicDir: path.join(CAPTIK_DIR, 'public'),
       outDir: tmp,
-      // Same alias captik-app's remotion.config.ts sets for the Lambda site.
-      webpackOverride: (c) => ({ ...c, resolve: { ...c.resolve, alias: { ...(c.resolve?.alias || {}), '@': path.join(CAPTIK_APP_DIR, 'src') } } }),
+      // Same `@` alias captik-app's remotion.config.ts sets for the Lambda site (shims first, matched exactly).
+      webpackOverride: (c) => ({
+        ...c,
+        resolve: {
+          ...c.resolve,
+          alias: {
+            ...(c.resolve?.alias || {}),
+            ...Object.fromEntries(Object.entries(SHIMS).map(([spec, file]) => [`${spec}$`, file])),
+            '@': CAPTIK_SRC,
+          },
+        },
+      }),
     });
     await fsp.rm(outDir, { recursive: true, force: true });
     await fsp.rename(tmp, outDir);
@@ -153,7 +172,7 @@ export function captionPropsFromEdit(edit) {
  */
 export async function renderWithCaptik({ baseVideo, outFile, captionProps, fps, durationInFrames, onProgress }) {
   const serveUrl = await ensureBundle();
-  const { selectComposition, renderMedia } = captikRequire('@remotion/renderer');
+  const { selectComposition, renderMedia } = require('@remotion/renderer');
   const asset = await serveAsset(baseVideo);
   try {
     const inputProps = {

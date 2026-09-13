@@ -8,7 +8,8 @@ export const JOBS_DIR = path.join(DATA_DIR, 'jobs');
 export const TRAINING_DIR = path.join(ROOT, 'training');
 export const FONTS_DIR = path.join(ROOT, 'assets', 'fonts');
 // Production-master checkout of captik-app: caption templates, editor components, fonts.
-export const CAPTIK_APP_DIR = path.resolve(process.env.CAPTIK_APP_DIR || path.join(ROOT, '..', 'Captik', 'captik-app'));
+// Captik's templates, editor components and fonts, vendored unchanged from captik-app (npm run sync:captik).
+export { CAPTIK_DIR, CAPTIK_SRC, CAPTIK_FONTS, SHIMS } from '../captik/paths.mjs';
 
 const num = (v, d) => (v === undefined || v === '' || Number.isNaN(Number(v)) ? d : Number(v));
 

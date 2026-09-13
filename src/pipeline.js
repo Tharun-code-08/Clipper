@@ -13,12 +13,13 @@ import { alignSection } from './align.js';
 import { renderBase } from './render.js';
 import { toCaptikWords } from './segments.js';
 import { romanizeClips, needsRoman } from './romanize.js';
+import { validateTrim, partCovers, retimeEdit, trimWindow, TRIM_FETCH_PAD_SEC, TRIM_MIN_SEC, TRIM_MAX_SEC } from './trim.js';
 import { directClips, editStateFor, validateStyle, loadTemplateCatalog } from './director.js';
 import { renderWithCaptik, captionPropsFromEdit } from './captikRender.js';
 import { loadModel, measureContext, measureClip, llmFeatures, computeScore, tierOf } from './virality.js';
 import { llmLineItem, sttLineItem, alignLineItem, computeLineItem, summarize, recordCalibration } from './cost.js';
 import { loadFeedback } from './feedback.js';
-import { clamp, fmtTime, mapLimit, readJson, writeJson } from './util.js';
+import { clamp, exists, fmtTime, mapLimit, readJson, writeJson } from './util.js';
 
 // Architecture: get the audio → transcribe → the LLM picks the best parts → download ONLY those parts
 // → frames from those parts → the LLM styles captions from the frames → render with Captik's templates.
@@ -323,21 +324,24 @@ async function stageStyle(ctx) {
   await saveJob(job);
 }
 
+/** Virality score: the curator's judgement + features measured over the clip's current range. */
+function scoreClip(c, mctx, model) {
+  const m = measureClip(c, mctx);
+  const cuts = c.track?.cuts ?? 0;
+  m.features.visual = Math.round(clamp(cuts / (c.duration / 60) / 8, 0, 1) * 1000) / 1000;
+  m.stats.sceneCuts = cuts;
+  c.features = { ...llmFeatures(c.scores), ...m.features };
+  c.stats = m.stats;
+  c.score = computeScore(c.features, model.weights);
+  c.tier = tierOf(c.score);
+}
+
 async function stageScore(ctx) {
   const { job } = ctx;
   setStage(job, 'score', { status: 'running', progress: 0 });
   const model = await loadModel();
   const mctx = measureContext({ words: ctx.stt.words, loudness: ctx.loud, scenes: [] });
-  for (const c of job.clips) {
-    const m = measureClip(c, mctx);
-    const cuts = c.track?.cuts ?? 0;
-    m.features.visual = Math.round(clamp(cuts / (c.duration / 60) / 8, 0, 1) * 1000) / 1000;
-    m.stats.sceneCuts = cuts;
-    c.features = { ...llmFeatures(c.scores), ...m.features };
-    c.stats = m.stats;
-    c.score = computeScore(c.features, model.weights);
-    c.tier = tierOf(c.score);
-  }
+  for (const c of job.clips) scoreClip(c, mctx, model);
   job.clips.sort((a, b) => (a.status === 'error') - (b.status === 'error') || b.score - a.score);
   job.clips.forEach((c, i) => { c.rank = i + 1; });
   job.scoreModel = { trained: model.trained, trainedAt: model.trainedAt || null, samples: model.samples || 0 };
@@ -489,5 +493,202 @@ async function pumpRerenders() {
     emit(job);
     rerendering = false;
     pumpRerenders();
+  }
+}
+
+
+// ── Trim ─────────────────────────────────────────────────────────────────────────────────────────
+// A re-curated job reuses the audio, transcript and (for uploads) the video of the job it came from.
+const sourceJobIdOf = (job) => job.source?.sourceJobId || job.id;
+const sourceDirOf = (job) => jobDir(sourceJobIdOf(job));
+const r2 = (v) => Math.round(v * 100) / 100;
+const r3 = (v) => Math.round(v * 1000) / 1000;
+const httpError = (status, message) => Object.assign(new Error(message), { status });
+
+const analysisCache = new Map();
+function loadAnalysis(job) {
+  const key = sourceJobIdOf(job);
+  if (!analysisCache.has(key)) {
+    const loading = readJson(path.join(sourceDirOf(job), 'analysis.json')).then((a) => {
+      if (!a?.stt?.words?.length || !a.loud?.db) throw httpError(400, 'This job has no saved transcript, so its clips cannot be trimmed.');
+      return a;
+    });
+    loading.catch(() => analysisCache.delete(key));
+    analysisCache.set(key, loading);
+    if (analysisCache.size > 4) analysisCache.delete(analysisCache.keys().next().value);
+  }
+  return analysisCache.get(key);
+}
+
+/** The video a clip is cut from — its downloaded part or the uploaded file — in source seconds. */
+async function clipVideo(job, clip) {
+  if (clip.part?.local) {
+    if (!job.source?.fullVideo) return null;
+    return {
+      file: path.join(sourceDirOf(job), job.source.fullVideo),
+      url: `/media/${sourceJobIdOf(job)}/${job.source.fullVideo}`,
+      offset: 0,
+      duration: job.source.duration,
+      local: true,
+    };
+  }
+  if (!clip.part?.file) return null;
+  const file = path.join(jobDir(job.id), clip.part.file);
+  if (!(await exists(file))) return null;
+  const pr = await probe(file);
+  return { file, url: `/media/${job.id}/${clip.part.file}`, offset: clip.part.offset, duration: pr.duration, local: false, probe: pr };
+}
+
+/** What the editor's trim track draws: source words, loudness and the downloaded video around a clip. */
+export async function trimSource(job, clip, { contextSec = 30 } = {}) {
+  const analysis = await loadAnalysis(job);
+  const sourceDuration = job.source.duration;
+  const win = trimWindow({ clip, sourceDuration, contextSec: clamp(Number(contextSec) || 30, 5, 300) });
+  const { loud } = analysis;
+  const i0 = Math.max(0, Math.floor(win.from / loud.stepSec));
+  const i1 = Math.min(loud.db.length, Math.ceil(win.to / loud.stepSec));
+  const video = await clipVideo(job, clip);
+  return {
+    sourceDuration,
+    window: win,
+    clip: { start: clip.start, end: clip.end },
+    original: clip.trim?.original || { start: clip.start, end: clip.end },
+    words: analysis.stt.words.filter((w) => w.e >= win.from && w.s <= win.to).map((w) => ({ w: w.w, s: r2(w.s), e: r2(w.e) })),
+    captions: (clip.edit?.words || []).map((w) => ({ text: w.text, s: r2(clip.start + w.startMs / 1000), e: r2(clip.start + w.endMs / 1000) })),
+    loud: { stepSec: loud.stepSec, from: i0 * loud.stepSec, db: loud.db.slice(i0, i1).map((d) => Math.round(d * 10) / 10) },
+    video: video && { url: video.url, offset: video.offset, from: video.offset, to: video.offset + video.duration, local: video.local },
+    audio: job.source.audioFile ? { url: `/media/${sourceJobIdOf(job)}/${job.source.audioFile}` } : null,
+    canFetch: Boolean(job.source.url || job.input.url) && !video?.local,
+    limits: { min: TRIM_MIN_SEC, max: TRIM_MAX_SEC, fetchPad: TRIM_FETCH_PAD_SEC },
+  };
+}
+
+const BUSY = new Set(['trimming', 'rendering', 'queued']);
+
+/** Validate a trim and start it in the background; progress and the result arrive on the job's event stream. */
+export async function startTrim(job, clip, range) {
+  if (BUSY.has(clip.status)) {
+    throw httpError(409, clip.status === 'trimming' ? 'This clip is already being trimmed.' : 'Wait for this clip to finish exporting.');
+  }
+  const next = validateTrim(range, { sourceDuration: job.source.duration });
+  const prevStatus = clip.status;
+  clip.status = 'trimming';
+  clip.trim = { ...clip.trim, stage: 'Preparing', progress: 0, error: null };
+  emit(job);
+  let video;
+  const url = job.source.url || job.input.url;
+  try {
+    await loadAnalysis(job);
+    video = await clipVideo(job, clip);
+    if (!partCovers(video, next) && !url) throw httpError(400, 'That range reaches past the downloaded video, and there is no link to fetch more from.');
+  } catch (err) {
+    Object.assign(clip, { status: prevStatus, trim: { ...clip.trim, stage: null, progress: 0 } });
+    emit(job);
+    throw err;
+  }
+  runTrim(job, clip, next, { video, url, prevStatus });
+  return next;
+}
+
+async function runTrim(job, clip, range, { video, url, prevStatus }) {
+  const dir = jobDir(job.id);
+  const original = clip.trim?.original || { start: clip.start, end: clip.end };
+  const stage = (label, progress) => {
+    clip.trim = { ...clip.trim, stage: label, progress: Math.round(progress * 100) / 100 };
+    emit(job);
+  };
+  try {
+    const analysis = await loadAnalysis(job);
+    let part = video;
+    let partMeta = null;
+    if (!partCovers(part, range)) {
+      const from = Math.max(0, range.start - TRIM_FETCH_PAD_SEC);
+      const to = Math.min(job.source.duration, range.end + TRIM_FETCH_PAD_SEC);
+      const label = `Downloading ${fmtTime(to - from)} of video`;
+      stage(label, 0);
+      const id = `${clip.id}_t${Date.now().toString(36)}`;
+      const { sections, errors } = await fetchSections(url, path.join(dir, 'parts'), [{ id, start: from, end: to }], {
+        onProgress: (p) => stage(label, 0.5 * p),
+      });
+      const s = sections.get(id);
+      if (!s) throw new Error(errors.get(id) || 'That part of the video could not be downloaded.');
+      const [pr, al] = await Promise.all([
+        probe(s.file),
+        alignSection({ sectionFile: s.file, sourceAudio: path.join(sourceDirOf(job), job.source.audioFile), expectedStart: s.start })
+          .catch(() => ({ offset: s.start, score: 0, aligned: false })),
+      ]);
+      part = { file: s.file, offset: al.offset, duration: pr.duration, local: false, probe: pr };
+      partMeta = { file: rel(dir, s.file), offset: r3(al.offset), aligned: al.aligned, score: r3(al.score) };
+      if (!partCovers(part, range)) throw new Error('The downloaded video does not cover that range. Try a slightly shorter trim.');
+    }
+
+    const stamp = Date.now().toString(36);
+    const base = `clips/${clip.id}_base_${stamp}.mp4`;
+    const next = { ...clip, start: range.start, end: range.end, duration: range.duration };
+    stage('Cutting the 9:16 video', 0.5);
+    await renderBase({
+      inputFile: part.file,
+      inStart: Math.max(0, range.start - part.offset),
+      probe: part.probe || await probe(part.file),
+      clip: next,
+      outFile: path.join(dir, base),
+      onProgress: (p) => stage('Cutting the 9:16 video', 0.5 + 0.35 * p),
+    });
+    const frames = [];
+    for (const [k, f] of [0.2, 0.5, 0.8].entries()) {
+      const file = `clips/${clip.id}_f${k}_${stamp}.jpg`;
+      await grabFrame(path.join(dir, base), range.duration * f, path.join(dir, file), 360);
+      frames.push({ t: Math.round(range.duration * f * 10) / 10, file });
+    }
+
+    stage('Updating captions', 0.9);
+    const sourceWords = analysis.stt.words;
+    let { edit, added } = retimeEdit(clip.edit, { oldStart: clip.start, oldEnd: clip.end, start: range.start, end: range.end, sourceWords, idPrefix: `t${stamp}_` });
+    if (config.captionScript === 'roman' && added.length && needsRoman(added)) {
+      try {
+        const r = await romanizeClips([{ id: clip.id, words: added }], { model: job.input.model });
+        const roman = new Map((r.words.get(clip.id) || []).map((w) => [w.id, w]));
+        edit = { ...edit, words: edit.words.map((w) => roman.get(w.id) || w) };
+        if (job.cost?.items) {
+          job.cost = summarize([...job.cost.items, { ...llmLineItem(r.model, r.usage), stage: 'Romanize' }], {
+            sourceMinutes: (job.source.duration || 60) / 60,
+            clipCount: job.clips.filter((c) => c.file).length,
+          });
+        }
+      } catch (err) {
+        logLine(job, `Kept Devanagari for the new words in "${clip.title}": ${err.message}`);
+      }
+    }
+
+    const [model, oldFiles] = [await loadModel(), [clip.base, ...(clip.frames || []).map((f) => f.file)].filter(Boolean)];
+    Object.assign(clip, {
+      start: range.start,
+      end: range.end,
+      duration: range.duration,
+      layout: next.layout,
+      track: next.track,
+      ...(partMeta ? { part: partMeta } : {}),
+      base,
+      frames,
+      poster: frames[1].file,
+      transcript: sourceWords.filter((w) => w.s >= range.start - 0.05 && w.e <= range.end + 0.05).map((w) => w.w).join(' '),
+      edit,
+      dirty: true,
+      status: prevStatus,
+      trim: { original, trimmedAt: new Date().toISOString(), count: (clip.trim?.count || 0) + 1, stage: null, progress: 1, error: null },
+    });
+    scoreClip(clip, measureContext({ words: sourceWords, loudness: analysis.loud, scenes: [] }), model);
+    logLine(job, `Trimmed #${clip.rank} "${clip.title}" to ${fmtTime(range.start)}–${fmtTime(range.end)} (${range.duration.toFixed(1)} s)`);
+    await saveJob(job);
+    emit(job);
+    // The editor may still be streaming the previous base for a moment.
+    setTimeout(() => {
+      for (const f of oldFiles) fs.rm(path.join(dir, f), { force: true }).catch(() => {});
+    }, 60_000).unref();
+  } catch (err) {
+    Object.assign(clip, { status: prevStatus, trim: { ...clip.trim, stage: null, progress: 0, error: err.message } });
+    logLine(job, `Trim failed for "${clip.title}": ${err.message}`);
+    await saveJob(job).catch(() => {});
+    emit(job);
   }
 }

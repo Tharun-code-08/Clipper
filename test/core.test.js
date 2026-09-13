@@ -183,13 +183,15 @@ test('cuts are single-frame histogram spikes; shots without a person letterbox',
   assert.deepEqual(cuts.flatMap((c, i) => (c ? [i] : [])), [4]);
   assert.equal(detectCuts([0, 0.5, 0.55, 0.6, 0.52, 0.58, 0.5]).filter(Boolean).length, 0, 'a sustained camera move is not a cut');
 
-  const obs = Array.from({ length: 80 }, (_, i) => ({ t: i / 8, skin: i < 40 ? 0.35 : 0, cut: i === 40 }));
+  const obs = Array.from({ length: 80 }, (_, i) => ({ t: i / 8, skin: i < 40 ? 0.35 : 0, skinMotion: 5, cut: i === 40 }));
   const shots = shotModes(obs, { duration: 10 });
   assert.deepEqual(shots.map((s) => s.mode), ['crop', 'fit']);
   assert.ok(Math.abs(shots[1].from - 4.938) < 0.01);
 
-  const flicker = Array.from({ length: 80 }, (_, i) => ({ t: i / 8, skin: i >= 30 && i < 36 ? 0 : 0.3, cut: i === 30 || i === 36 }));
+  const flicker = Array.from({ length: 80 }, (_, i) => ({ t: i / 8, skin: i >= 30 && i < 36 ? 0 : 0.3, skinMotion: 5, cut: i === 30 || i === 36 }));
   assert.deepEqual(shotModes(flicker, { duration: 10 }).map((s) => s.mode), ['crop'], 'a 0.75 s no-person shot inherits crop');
+  const chart = Array.from({ length: 40 }, (_, i) => ({ t: i / 8, skin: 0.006, skinMotion: i ? 0 : null, cut: false }));
+  assert.deepEqual(shotModes(chart, { duration: 5 }).map((s) => s.mode), ['fit'], 'static skin-coloured graphics letterbox');
 
   const graph = layoutFilter({ width: 1920, height: 1080 }, { layout: 'crop', focusX: 0.5 }, { keys: [{ t: 0, x: 0.3 }, { t: 10, x: 0.3 }], shots });
   assert.match(graph, /\[fit\]\[crop\]overlay=0:0:enable='between\(t,0\.000,4\.938\)'/);

@@ -47,6 +47,8 @@ Claude cannot be fine-tuned through the public API, so the prototype trains the 
 
    **Re-curate with my ratings** reruns curation on a finished job's saved transcript and frames. That costs only the LLM call, with no new download or transcription.
 
+   Verified end to end on the TED talk: after rating 3 picks ▲ and 3 ▼, re-curation returned all 3 liked moments at the top (91 / 84 / 83 with the trained weights), dropped all 3 disliked ones, and found 2 new picks, for $0.239.
+
 ## Virality score
 
 | Feature | Source | Default weight |
@@ -98,7 +100,7 @@ Expect higher token counts for Hindi and other Devanagari transcripts than for E
 
 ## Known limits
 
-- **Subject tracking is a heuristic** (YCbCr skin tone + motion + edges, cut detection by histogram spikes), not face detection. It is verified on stage and close-up footage. Lighting that pushes skin outside the colour range, or a wide two-person podcast shot, can pick the wrong region. There is no active-speaker detection yet.
+- **Subject tracking is a heuristic** (YCbCr skin tone + motion + edges, cut detection by histogram spikes), not face detection. A shot is cropped only when skin-toned pixels also *move*; static skin-coloured graphics (orange chart bars) and still photos letterbox instead. It is verified on stage, close-up, chart-slide and photo footage. Lighting that pushes skin outside the colour range, or a wide two-person podcast shot, can pick the wrong region. There is no active-speaker detection yet.
 - Instagram and Facebook often require cookies (see above). Private Drive files need "Anyone with the link".
 - Groq's free tier caps audio per hour/day; long videos may hit rate limits (the client retries 429s).
 - No auth, no queue persistence across restarts (running jobs are marked failed on restart).

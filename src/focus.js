@@ -6,6 +6,8 @@ export const TRACK_FPS = 8;
 const TRACK_W = 192;
 // Measured on TED footage: close-ups ~36-41% skin pixels, wide stage shots 0.9-4%, slides/audience 0%.
 const PERSON_SKIN = 0.005;
+// Mean luma change inside the skin mask: people 1.7-3.4 (wide) / 27-30 (close-up); orange chart bars and still photos 0.00.
+const PERSON_MOTION = 0.8;
 const MIN_SHOT_SEC = 1.5;
 
 /** Decode [start, start+duration) of the source as tiny rgb24 frames at TRACK_FPS. */
@@ -69,6 +71,8 @@ export function frameSignal(rgb, prevLuma, w, h) {
   const motion = new Float32Array(w);
   const edge = new Float32Array(w);
   const luma = new Float32Array(w * h);
+  let skinDiff = 0;
+  let skinCount = 0;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = y * w + x;
@@ -79,9 +83,14 @@ export function frameSignal(rgb, prevLuma, w, h) {
       const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
       const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
       luma[i] = Y;
-      if (Y > 50 && cb >= 77 && cb <= 127 && cr >= 135 && cr <= 173) skin[x] += 1;
+      const isSkin = Y > 50 && cb >= 77 && cb <= 127 && cr >= 135 && cr <= 173;
+      if (isSkin) skin[x] += 1;
       if (x > 0) edge[x] += Math.abs(Y - luma[i - 1]);
-      if (prevLuma && Math.abs(Y - prevLuma[i]) > 18) motion[x] += 1;
+      if (prevLuma) {
+        const d = Math.abs(Y - prevLuma[i]);
+        if (d > 18) motion[x] += 1;
+        if (isSkin) { skinDiff += d; skinCount += 1; }
+      }
     }
   }
   const norm = (arr) => {
@@ -96,7 +105,7 @@ export function frameSignal(rgb, prevLuma, w, h) {
   const motionMass = motion.reduce((a, v) => a + v, 0) / (w * h);
   const cols = new Float32Array(w);
   for (let x = 0; x < w; x++) cols[x] = 3 * skinN[x] * Math.min(1, skinMass * 40) + 1.5 * motionN[x] * Math.min(1, motionMass * 20) + 0.5 * edgeN[x];
-  return { cols, luma, skin: skinMass, strength: skinMass * 40 + motionMass * 20 };
+  return { cols, luma, skin: skinMass, skinMotion: prevLuma && skinCount ? skinDiff / skinCount : null, strength: skinMass * 40 + motionMass * 20 };
 }
 
 /** Centre (0..1) of the crop window that captures the most signal, and how dominant that window is. */
@@ -117,9 +126,9 @@ export function bestWindow(cols, windowFrac) {
 }
 
 /**
- * Split observations [{t, skin, cut}] into shots and choose a layout for each:
- * 'crop' when a person is on screen (tracked 9:16 crop), 'fit' otherwise (slides, screens, audience)
- * so nothing important is cut off. Shots shorter than MIN_SHOT_SEC inherit a neighbour's mode.
+ * Split observations [{t, skin, skinMotion, cut}] into shots and choose a layout for each:
+ * 'crop' when a moving person is on screen (tracked 9:16 crop), 'fit' otherwise so nothing important is cut off:
+ * slides, screens, audience, still photos, and skin-coloured graphics like orange chart bars (they never move). Shots shorter than MIN_SHOT_SEC inherit a neighbour's mode.
  */
 export function shotModes(obs, { duration }) {
   if (!obs.length) return [{ from: 0, to: duration, mode: 'crop' }];
@@ -128,7 +137,9 @@ export function shotModes(obs, { duration }) {
   let cur = [];
   const close = () => {
     if (!cur.length) return;
-    shots.push({ from: shots.length ? cur[0].t - half : 0, mode: (median(cur.map((o) => o.skin)) ?? 0) >= PERSON_SKIN ? 'crop' : 'fit' });
+    const moving = cur.map((o) => o.skinMotion).filter((m) => m !== null && m !== undefined);
+    const person = (median(cur.map((o) => o.skin)) ?? 0) >= PERSON_SKIN && (median(moving) ?? 0) >= PERSON_MOTION;
+    shots.push({ from: shots.length ? cur[0].t - half : 0, mode: person ? 'crop' : 'fit' });
     cur = [];
   };
   for (const o of obs) {
@@ -218,7 +229,7 @@ export async function trackSubject({ sourceFile, probe, clip, prior = 0.5 }) {
     // Motion across a cut compares two different shots, so it is skipped on the first frame of a shot.
     const sig = frameSignal(rgb, cutFlags[i] ? null : prevLuma, TRACK_W, h);
     const { center, share } = bestWindow(sig.cols, windowFrac);
-    obs.push({ t: i / TRACK_FPS, center, share, strength: sig.strength, skin: sig.skin, cut: cutFlags[i] });
+    obs.push({ t: i / TRACK_FPS, center, share, strength: sig.strength, skin: sig.skin, skinMotion: sig.skinMotion, cut: cutFlags[i] });
     prevLuma = sig.luma;
   });
   return {

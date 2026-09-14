@@ -269,7 +269,22 @@ export default function ClipEditor({ job, clip, onSelectClip }) {
 
   // ── style panel + canvas geometry ──────────────────────────────────────────────────────────────
   const scoped = selectedSegmentKeys.length > 0;
-  const onStyleChange = (id) => (scoped ? onSegmentStyleChange(selectedSegmentKeys, id) : patchStyle({ captionStyle: id }));
+  // Switching the whole video's template behaves as in Captik's editor: the colours of the template being left
+  // are remembered, the target's remembered colours (or its own defaults) come back, and The Big Red moves the
+  // caption to its top-middle lockup.
+  const perTemplateColors = useRef({});
+  const applyTemplate = (next) => {
+    if (next === style.captionStyle) return;
+    perTemplateColors.current[style.captionStyle] = { accentColor: style.accentColor, captionTextColor: style.captionTextColor };
+    const saved = perTemplateColors.current[next];
+    patchStyle({
+      captionStyle: next,
+      accentColor: saved?.accentColor ?? '#06b6d4',
+      captionTextColor: saved?.captionTextColor ?? '#ffffff',
+      ...(next === 'big_red' ? { captionBox: { xPercent: 50, yPercent: 30, widthPercent: 84 } } : {}),
+    });
+  };
+  const onStyleChange = (id) => (scoped ? onSegmentStyleChange(selectedSegmentKeys, id) : applyTemplate(id));
   const onCaptionBoxChange = (box) => (scoped ? patchLineOverride(selectedSegmentKeys, { box }) : patchStyle({ captionBox: box }));
   const positionBox = (scoped && derived.segmentBoxOverrides[selectedSegmentKeys[0]]) || style.captionBox;
   const onPositionChange = (x, y) => onCaptionBoxChange({ ...positionBox, xPercent: x, yPercent: y });
@@ -279,6 +294,43 @@ export default function ClipEditor({ job, clip, onSelectClip }) {
   const seek = (ms) => canvas.current?.seekTo(ms);
   const chooseRailTab = (t) => { setRailTab(t); writePref('studio.railTab', t); };
   const toggleTrim = () => setTrimCollapsed((c) => { writePref('studio.trimCollapsed', !c); return !c; });
+
+  // Captik's editor shortcuts: Space play/pause, ←/→ 5 s, Ctrl/⌘+Z undo, Ctrl/⌘+Shift+Z or Ctrl/⌘+Y redo, 1–0 templates.
+  const shortcuts = useRef(null);
+  shortcuts.current = (e) => {
+    if (['INPUT', 'TEXTAREA'].includes(e.target?.tagName) || e.target?.isContentEditable || trimming) return;
+    switch (e.key) {
+      case 'z':
+      case 'Z':
+        if (e.ctrlKey || e.metaKey) { e.preventDefault(); if (e.shiftKey) onRedo(); else onUndo(); }
+        break;
+      case 'y':
+      case 'Y':
+        if (e.ctrlKey || e.metaKey) { e.preventDefault(); onRedo(); }
+        break;
+      case ' ':
+        e.preventDefault();
+        togglePlay();
+        break;
+      case 'ArrowLeft':
+        e.preventDefault();
+        seek(Math.max(0, currentTimeMs - 5000));
+        break;
+      case 'ArrowRight':
+        e.preventDefault();
+        seek(Math.min(durationMs, currentTimeMs + 5000));
+        break;
+      default: {
+        const template = { 1: 'hormozi', 2: 'mrbeast', 3: 'minimal', 4: 'glow', 5: 'pop', 6: 'fire', 7: 'wordpop', 8: 'grit', 9: 'prism', 0: 'glitch' }[e.key];
+        if (template) applyTemplate(template);
+      }
+    }
+  };
+  useEffect(() => {
+    const onKey = (e) => shortcuts.current?.(e);
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   const captionsPanel = (
     <LeftPanel
@@ -305,7 +357,10 @@ export default function ClipEditor({ job, clip, onSelectClip }) {
         resolution={resolution} onResolutionChange={setResolution} allow4k={false}
         onExport={onExport} onDownloadSRT={onDownloadSRT} srtLocked={false}
         onSave={() => save().catch((err) => alert(err.message))}
-        onBack={() => { location.href = `/#/job/${JOB_ID}`; }}
+        onBack={() => {
+          if (rendering && !window.confirm('An export is still in progress. Leave the editor anyway?')) return;
+          location.href = `/#/job/${JOB_ID}`;
+        }}
         rendering={rendering} renderProgress={Math.round((clip.progress || 0) * 100)} canExport={!trimming} isSaving={saving}
       />
       <div className="flex min-h-0 flex-1 overflow-hidden">

@@ -67,6 +67,15 @@ export async function getJob(id, { raw = false } = {}) {
   return job;
 }
 
+const posterOf = (j) => {
+  const c = j.clips.find((x) => x.poster);
+  return c ? `/media/${j.id}/${c.poster}` : null;
+};
+const progressOf = (j) => STAGES.reduce((a, s) => {
+  const st = j.stages?.[s.key];
+  return a + (st?.status === 'done' ? 1 : st?.progress || 0);
+}, 0) / STAGES.length;
+
 export async function listJobs() {
   const names = await fs.readdir(JOBS_DIR).catch(() => []);
   const jobs = (await Promise.all(names.map((n) => getJob(n)))).filter(Boolean);
@@ -82,6 +91,10 @@ export async function listJobs() {
       clipCount: j.clips.length,
       topScore: j.clips.reduce((m, c) => Math.max(m, c.score || 0), 0) || null,
       costUsd: j.cost?.usd ?? null,
+      thumbnail: j.source?.thumbnail || null,
+      poster: posterOf(j),
+      progress: Math.round(progressOf(j) * 1000) / 1000,
+      stage: STAGES.find((s) => j.stages?.[s.key]?.status === 'running')?.label || null,
     }));
 }
 

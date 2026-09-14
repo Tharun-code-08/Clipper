@@ -8,8 +8,10 @@
     "start": "node --env-file-if-exists=.env server.js",
     "dev": "node --watch-path=server.js --watch-path=src --env-file-if-exists=.env server.js",
     "train": "node --env-file-if-exists=.env training/train.js",
-    "build:editor": "vite build --config web/vite.config.mjs",
-    "sync:captik": "node scripts/sync-captik.mjs"
+    "build:editor": "npm run build",
+    "sync:captik": "node scripts/sync-captik.mjs",
+    "build": "vite build --config web/vite.config.mjs",
+    "dev:web": "vite --config web/vite.config.mjs"
   },
   "license": "ISC",
   "type": "module",

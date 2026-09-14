@@ -21,7 +21,8 @@ await fs.mkdir(UPLOAD_DIR, { recursive: true });
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
-app.use(express.static(path.join(ROOT, 'public')));
+// The clipper home (/) and the clip studio (/editor/), built by Vite from web/ (npm run build).
+app.use(express.static(path.join(ROOT, 'dist')));
 // Captik's fonts first (the editor + templates reference /fonts/*), then the clipper's own.
 app.use('/fonts', express.static(CAPTIK_FONTS));
 app.use('/fonts', express.static(path.join(ROOT, 'assets', 'fonts')));
@@ -288,6 +289,8 @@ app.get('/api/health', async (_req, res) => {
     ytdlp: toolCache[1],
     anthropicKey: Boolean(config.anthropicKey),
     groqKey: Boolean(config.groqKey),
+    sarvamKey: Boolean(config.sarvamKey),
+    wordTiming: Boolean(config.elevenlabsKey || config.supabaseServiceRoleKey),
     maxClips: MAX_CLIPS,
     defaults: { model: config.curatorModel, sttModel: config.sttModel },
     models: Object.keys(LLM_PRICING),

@@ -56,7 +56,7 @@ export default function Studio() {
   }, [clip, clipId, selectClip]);
 
   if (error) return <Splash>{error}</Splash>;
-  if (!job) return <Splash>Loading clips…</Splash>;
+  if (!job) return <Splash><div className="h-6 w-6 animate-spin rounded-full border-2 border-white/20 border-t-amber-400" /></Splash>;
   if (!clip) return <Splash>No clip in this job is ready to edit yet.</Splash>;
   return <ClipEditor key={`${clip.id}:${clip.trim?.trimmedAt || ''}`} job={job} clip={clip} onSelectClip={selectClip} />;
 }

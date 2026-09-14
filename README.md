@@ -27,7 +27,8 @@ link ──► py/fetch.py: AUDIO ONLY ──► Sarvam saaras:v3 (codemix) + El
 | **Frames & style** | Each part becomes a 1080×1920 base video: a subject-tracking crop per shot, letterbox for slides, charts and photos, and −14 LUFS loudness. Frames from the base go to Claude with the clip's words and Captik's template catalogue. It returns the template, accent and text colour, a face-safe caption height, size, emphasised words and screen-shake beats, all validated. | `src/render.js`, `src/focus.js`, `src/director.js` |
 | **Score** | 0–100 virality score from the curator's judgement plus audio and visual features measured over the clip. | `src/virality.js` |
 | **Render** | Captik's `KineticCaption` composition (`LambdaCaptionComposition` → `CaptionOverlay`, the component Captik's editor previews with), bundled from `captik/src` and rendered locally with Remotion 4.0.470, the version captik-app ships. | `src/captikRender.js`, `captik/` |
-| **Clip studio** | `/editor/?job=…&clip=…`. Captik's `TopBar`, `VideoCanvas`, `RightPanel` (templates, text, style) and `EditorTimeline`, plus a **Clips / Captions** rail. The Clips tab lists every clip with its rank, score and export state; the Captions tab is Captik's `LeftPanel`. Word and line edits, per-line templates, colours, position, undo and SRT all work; changes autosave, and **Export** re-renders through the same composition. | `web/`, `server.js` |
+| **Home** | `/` follows Captik's signed-in dashboard: Captik's collapsible sidebar, a link bar above Captik's drop zone, and a **Prepare Your Clips** modal (clip count, curator, transcriber, live cost estimate) modelled on Captik's *Prepare Your Media*. Runs show as project cards. A run page has Captik's processing card while it works, then clip cards (hover preview, score, Edit, download, copy caption, 👍/👎, why this clip), the source map and the receipt. **Cost per video** and **Train the curator** are pages in the same sidebar. | `web/src/home/` |
+| **Clip studio** | `/editor/?job=…&clip=…`. Captik's `TopBar`, `VideoCanvas`, `RightPanel` (templates, text, style) and `EditorTimeline`, plus a **Clips / Captions** rail. The Clips tab lists every clip with its rank, score and export state; the Captions tab is Captik's `LeftPanel`. Word and line edits, per-line templates, colours, position, undo and SRT all work, with Captik's keyboard shortcuts (Space, ←/→, Ctrl+Z / Ctrl+Y, 1–0 for templates) and its template switching; changes autosave, and **Export** re-renders through the same composition. | `web/`, `server.js` |
 | **Trim** | The trim strip above the timeline shows the source around the clip: transcript words, loudness, and which video is already downloaded. Drag the in/out handles (they snap to word boundaries; hold Alt to drag freely), or drag the length pill to slide the clip. Preview with **Hear in / Hear out / Play**, then apply. The server re-cuts the 9:16 base, downloading extra video with 15 s of headroom when the new range goes past the part. It re-times the captions, keeping every edit (hand-edited or romanized text, emphasis, deleted words, line styles), captions the newly revealed speech the way the pipeline would (romanized), and re-scores the clip. **AI pick** returns to the curator's range. | `src/trim.js`, `src/pipeline.js`, `web/src/TrimBar.jsx` |
 
 **Why audio first:** YouTube throttles single-stream downloads. The 581 MB 1080p file of a 52-minute episode
@@ -42,12 +43,12 @@ templates, editor components and fonts are in `captik/`, so no captik-app checko
 ```bash
 npm install
 cp .env.example .env        # keys, see below
-npm run build:editor        # builds the clip studio into public/editor
+npm run build               # builds the home and the clip studio into dist/
 npm start                   # http://localhost:4321
 npm test                    # unit tests, no network
 ```
 
-Open a finished job on the dashboard and press **Edit** on a clip to open the clip studio. The first render
+Paste a link or drop a file on the home page, choose the clip settings, and press **Edit** on any finished clip to open the clip studio. The first render
 downloads Remotion's headless Chrome and bundles the Captik composition, which takes about 2 minutes once.
 
 ## Captik templates and editor (`captik/`)
@@ -70,6 +71,11 @@ The sync follows imports from the composition and the editor surfaces. Type-only
 server code are skipped. If captik-app ever needs captik.in's servers at runtime (Next, Supabase, Gemini,
 MediaPipe), the sync refuses and names the file. Some fonts are commercially licensed, which is one reason this
 repository is private.
+
+**UI continuity.** Every screen is Captik's. The studio is Captik's editor components. The home imports Captik's
+`Logo`, `Tooltip`, `ProgressBar` and slider controls from `captik/src`, and copies Captik's dashboard, prepare
+modal and processing overlay class for class: `#0B0B0D` / `#09090d` surfaces, amber-500 actions, ClashDisplay page
+titles, Geist text, the same cards, labels, selects and empty states.
 
 ## "Training" the curator
 
@@ -148,7 +154,7 @@ side, except romanizing the newly revealed words (a fraction of a cent).
 ## Repo layout
 
 ```
-server.js              Express API, dashboard, clip studio, media
+server.js              Express API; serves dist/ (home + clip studio) and media
 py/fetch.py            yt-dlp Python API: audio-only and section downloads, JSON-line progress
 src/fetcher.js         runs fetch.py
 src/sarvamStt.js       silence chunking, Sarvam, ElevenLabs forced alignment
@@ -165,8 +171,7 @@ src/pipeline.js        stages, re-render queue, trim job
 src/virality.js        score, training      src/cost.js   receipts, estimator
 captik/                Captik templates, editor components, fonts (synced from captik-app)
 scripts/sync-captik.mjs  re-copies captik/ from a captik-app checkout
-web/                   clip studio (Vite): Studio, ClipEditor, ClipRail, TrimBar
-public/                dashboard
+web/                   Vite app: home (web/src/home) and clip studio (Studio, ClipEditor, ClipRail, TrimBar)
 training/              rubric, exemplars, train CLI
 test/                  node:test
 ```

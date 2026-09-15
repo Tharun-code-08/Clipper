@@ -290,7 +290,7 @@ app.get('/api/health', async (_req, res) => {
     anthropicKey: Boolean(config.anthropicKey),
     groqKey: Boolean(config.groqKey),
     sarvamKey: Boolean(config.sarvamKey),
-    wordTiming: Boolean(config.elevenlabsKey || config.supabaseServiceRoleKey),
+    wordTiming: Boolean(config.elevenlabsKey || (config.captikAlignUrl && (config.captikAlignToken || config.supabaseServiceRoleKey))),
     maxClips: MAX_CLIPS,
     defaults: { model: config.curatorModel, sttModel: config.sttModel },
     models: Object.keys(LLM_PRICING),

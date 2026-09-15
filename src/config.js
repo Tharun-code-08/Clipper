@@ -31,6 +31,8 @@ export const config = {
   // Without a direct ElevenLabs key, alignment goes through Captik's own elevenlabs-align edge function.
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
   captikAlignUrl: process.env.CAPTIK_ALIGN_URL || '',
+  // Access token for a scoped alignment proxy (e.g. Captik's clipper-align function): word timing only, no database access.
+  captikAlignToken: process.env.CAPTIK_ALIGN_TOKEN || '',
   ytdlp: process.env.YTDLP || '', // empty = auto: yt-dlp on PATH, else `python -m yt_dlp`
   // e.g. chrome / edge / firefox: lets yt-dlp reuse a logged-in browser for Instagram/Facebook.
   ytdlpCookiesFromBrowser: process.env.YTDLP_COOKIES_FROM_BROWSER || '',

@@ -103,8 +103,9 @@ async function sarvamChunk(wav, languageCode) {
 
 function alignTarget() {
   if (config.elevenlabsKey) return { url: 'https://api.elevenlabs.io/v1/forced-alignment', headers: { 'xi-api-key': config.elevenlabsKey }, via: 'elevenlabs' };
+  if (config.captikAlignToken && config.captikAlignUrl) return { url: config.captikAlignUrl, headers: { Authorization: `Bearer ${config.captikAlignToken}` }, via: 'captik-proxy' };
   if (config.supabaseServiceRoleKey && config.captikAlignUrl) return { url: config.captikAlignUrl, headers: { Authorization: `Bearer ${config.supabaseServiceRoleKey}` }, via: 'captik-edge' };
-  throw new Error('Word timing needs ELEVENLABS_API_KEY, or SUPABASE_SERVICE_ROLE_KEY + CAPTIK_ALIGN_URL to use Captik\'s elevenlabs-align function.');
+  throw new Error('Word timing needs ELEVENLABS_API_KEY, or CAPTIK_ALIGN_URL with CAPTIK_ALIGN_TOKEN (clipper-align) or SUPABASE_SERVICE_ROLE_KEY (elevenlabs-align).');
 }
 
 async function forcedAlign(wav, text) {

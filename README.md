@@ -131,7 +131,7 @@ side, except romanizing the newly revealed words (a fraction of a cent).
 |---|---|---|
 | `ANTHROPIC_API_KEY` | required | curation + styling |
 | `SARVAM_API_KEY` | required | transcription |
-| `ELEVENLABS_API_KEY` | — | direct forced alignment; **or** `SUPABASE_SERVICE_ROLE_KEY` + `CAPTIK_ALIGN_URL` to use Captik's `elevenlabs-align` edge function |
+| `ELEVENLABS_API_KEY` | — | direct forced alignment; **or** `CAPTIK_ALIGN_URL` (`…/clipper-align`) + `CAPTIK_ALIGN_TOKEN`, a scoped proxy that can only align (for collaborators); **or** `CAPTIK_ALIGN_URL` (`…/elevenlabs-align`) + `SUPABASE_SERVICE_ROLE_KEY` (owner only) |
 | `STT_MODEL` | `sarvam:saaras:v3` | `whisper-large-v3` (Groq, needs `GROQ_API_KEY`) is a fallback, but it translates Hinglish into English |
 | `CAPTION_SCRIPT` | `roman` | `native` keeps Sarvam's Devanagari captions |
 | `CAPTIK_APP_DIR` | `../Captik/captik-app` | only for `npm run sync:captik` |

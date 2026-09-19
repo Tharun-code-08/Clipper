@@ -46,6 +46,7 @@ cp .env.example .env        # keys, see below
 npm run build               # builds the home and the clip studio into dist/
 npm start                   # http://localhost:4321
 npm test                    # unit tests, no network
+npm run graphics:smoke      # renders all 1,641 motion-graphics templates
 ```
 
 Paste a link or drop a file on the home page, choose the clip settings, and press **Edit** on any finished clip to open the clip studio. The first render
@@ -63,8 +64,9 @@ downloads Remotion's headless Chrome and bundles the Captik composition, which t
 `captik/UPSTREAM.json` records the commit, the package versions and a hash of every file.
 
 ```bash
-npm run sync:captik                     # re-copy from CAPTIK_APP_DIR (default ../Captik/captik-app)
-npm run sync:captik -- --check          # exit 1 if captik/ has drifted from the checkout
+npm run sync:captik                     # re-copy captik/ and captik-graphics/ (CAPTIK_APP_DIR, CAPTIK_PREMIUM_DIR)
+npm run sync:captik -- --only graphics  # one slice: core | graphics
+npm run sync:captik -- --check          # exit 1 if a slice has drifted from its checkout
 ```
 
 The sync follows imports from the composition and the editor surfaces. Type-only imports that would pull in
@@ -76,6 +78,39 @@ repository is private.
 `Logo`, `Tooltip`, `ProgressBar` and slider controls from `captik/src`, and copies Captik's dashboard, prepare
 modal and processing overlay class for class: `#0B0B0D` / `#09090d` surfaces, amber-500 actions, ClashDisplay page
 titles, Geist text, the same cards, labels, selects and empty states.
+
+## Motion graphics and b-roll (`captik-graphics/`)
+
+`captik-graphics/src` is a file-for-file copy of Captik's premium editor line (`feat/shortform-showcase`):
+- the motion-graphics system: **1,641 templates**.
+  - 242 are Captik's own (`lib/graphics/templates/`).
+  - 1,399 are imported from Malloy Studio's library (`lib/graphics/malloy/`, loaded on demand).
+- the registry, `GraphicsOverlay` (the one renderer), and the Graphics tab and its auto-generated parameter panel;
+- the export composition that draws graphics and b-roll inserts;
+- the b-roll library and its catalogue of 1,008 clip records.
+
+None of it is wired into the pipeline yet; [TASKS.md](TASKS.md) is the plan. `npm run graphics:smoke` renders every template through `GraphicsOverlay` (currently 1,641 of 1,641 draw).
+
+- **Sound:** the premium branch's `sfxBank.ts` is licensed audio (Epidemic Sound and other packs) and is never copied.
+  - `captik-graphics/shims/sfxBank.ts` voices every template cue with Captik's 73 synthesized sounds instead.
+  - Each pack cue maps to its nearest synthesized sound: by name, else by shelf.
+- **Malloy templates:** their licence is not confirmed, and they hotlink images from Malloy's storage. Keep them out of anything
+  shipped until that is settled.
+- **B-roll clips:** not in git (about 4.6 GB, and Pexels/Pixabay forbid redistributing them as a library).
+  - `node captik-graphics/scripts/broll_ingest.mjs` builds them locally from a free `PEXELS_API_KEY` in `captik-graphics/.env.local`.
+
+Both vendored trees use `@/` for their own `src/`, so `captik/vite-plugin.mjs` resolves `@/…` against the tree the
+importing file lives in.
+
+`resources/features/` holds six finished Captik features to port:
+- auto-edit, sound and music
+- brand kit
+- cover thumbnails
+- face-aware captions
+- template variants
+- looks
+
+`.claude/skills/` has the shortform-video skills. See [resources/README.md](resources/README.md).
 
 ## "Training" the curator
 
@@ -169,8 +204,13 @@ src/trim.js            trim validation, caption re-timing that keeps edits
 src/captikRender.js    Captik composition bundle + render, editor-state sanitising
 src/pipeline.js        stages, re-render queue, trim job
 src/virality.js        score, training      src/cost.js   receipts, estimator
-captik/                Captik templates, editor components, fonts (synced from captik-app)
-scripts/sync-captik.mjs  re-copies captik/ from a captik-app checkout
+captik/                Captik templates, editor components, fonts (synced from captik-app master)
+captik-graphics/       motion graphics (1,641 templates), their export composition, b-roll library (premium line)
+resources/features/    six finished Captik features to port (files + patch + README each)
+.claude/skills/        shortform-video skills for Claude Code
+TASKS.md               what to build next
+scripts/sync-captik.mjs  re-copies captik/ and captik-graphics/ from Captik checkouts
+scripts/graphics-smoke.mjs  renders every graphics template
 web/                   Vite app: home (web/src/home) and clip studio (Studio, ClipEditor, ClipRail, TrimBar)
 training/              rubric, exemplars, train CLI
 test/                  node:test

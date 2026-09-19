@@ -1,0 +1,1696 @@
+ src/app/editor/page.tsx                    | 104 ++++++++++++++++++++--
+ src/components/editor/RightPanel.tsx       |   5 +-
+ src/components/editor/panel/TextTab.tsx    |  44 ++++++++-
+ src/hooks/useFaceGrids.ts                  |  80 +++++++++++++++++
+ src/lib/captionSegments.ts                 |  25 ++++--
+ src/lib/faceAware/captionPlacement.spec.ts | 342 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib/faceAware/captionPlacement.ts      | 531 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib/faceAware/faceGrid.spec.ts         |  68 ++++++++++++++
+ src/lib/faceAware/faceGrid.ts              |  87 ++++++++++++++++++
+ src/lib/matte/faceGridSampler.ts           | 124 ++++++++++++++++++++++++++
+ src/lib/matte/subjectMatte.ts              |   5 +-
+ src/lib/projectStore.ts                    |   3 +
+ src/types/transcript.ts                    |   4 +
+ 13 files changed, 1407 insertions(+), 15 deletions(-)
+
+diff --git a/src/app/editor/page.tsx b/src/app/editor/page.tsx
+index 1e2f476..9c3e85d 100644
+--- a/src/app/editor/page.tsx
++++ b/src/app/editor/page.tsx
+@@ -51,6 +51,12 @@ import {
+ import { sampleDominantColor, getComplementaryColor } from '@/lib/colorSampler';
+ import { probeMediaInfo, measureVideoFps, exportFps, isHevcSource, HEVC_UNSUPPORTED_MSG, type MediaInfo } from '@/lib/mediaInfo';
+ import { useSubjectMatte } from '@/hooks/useSubjectMatte';
++import { useFaceGrids } from '@/hooks/useFaceGrids';
++import {
++  faceAwareSampleTimes, planFaceAwareDetails, applyFaceDetails, faceAwareCounts, removeAutoBoxes,
++  markBoxPatchManual, countAutoBoxes, countManualBoxes, faceAwareOverrideSig, type FaceAwareCounts,
++} from '@/lib/faceAware/captionPlacement';
++import type { FaceAwareControl } from '@/components/editor/panel/TextTab';
+ import { subjectMatteWindows, allCaptionWindows } from '@/lib/matte/subjectMatte';
+ import { captureThumb } from '@/lib/videoThumb';
+ import type { BleepRange } from '@/lib/profanity';
+@@ -63,7 +69,7 @@ import { sanitizeRenderWords, safeDurationMs } from '@/lib/renderPayload';
+ import { CaptionExportComposition, type CaptionExportProps } from '@/remotion/CaptionExportComposition';
+ import type { CaptionBoxConfig, TextOverrides, EmphasisStyle, LayoutMode, LineOverride, TemplateSlotOverrides } from '@/types/transcript';
+ import { useIsMobile } from '@/hooks/useIsMobile';
+-import { type AspectRatio, aspectValue, exportDims, webExportBitrate, MIN_4K_SOURCE_LONG_EDGE } from '@/lib/aspect';
++import { type AspectRatio, aspectValue, exportDims, webExportBitrate, MIN_4K_SOURCE_LONG_EDGE, logicalCanvasSize } from '@/lib/aspect';
+ import { isFastStyle, isFastExportFont } from '@/lib/assGenerator';
+ import { computeWaveformPeaks } from '@/lib/waveform';
+ import { fontMimeFromBytes } from '@/lib/fontFamilies';
+@@ -574,16 +580,21 @@ export default function EditorPage() {
+   // Per-template slot overrides (editor_masala/illusion/aura) — global; per-line slots
+   // live in lineOverrides.slots and are derived into lineSlotOverrides below.
+   const [templateSlots,  setTemplateSlots]  = useState<TemplateSlotOverrides>({});
++  // "Keep captions off faces" — when on, lines that would cover the face get an automatic per-line
++  // box (lineOverrides[key].box flagged boxAuto). Persisted in the project snapshot.
++  const [keepOffFaces,   setKeepOffFaces]   = useState(false);
+ 
+   // Patch one line's override bundle; empty bundles are dropped so "has override"
+   // checks (chips, Remove Style) stay accurate. `patch` fields set to undefined clear.
++  // Every user edit of a line's box goes through here, so this is where a position becomes MANUAL
++  // (markBoxPatchManual clears boxAuto) — "Keep captions off faces" never moves it again.
+   const patchLineOverride = useCallback((keys: string | string[], patch: Partial<LineOverride> | null) => {
+     const keyList = Array.isArray(keys) ? keys : [keys];
+     setLineOverrides(prev => {
+       const next = { ...prev };
+       for (const key of keyList) {
+         if (patch === null) { delete next[key]; continue; }
+-        const merged: LineOverride = { ...next[key], ...patch };
++        const merged: LineOverride = { ...next[key], ...markBoxPatchManual(patch) };
+         (Object.keys(merged) as (keyof LineOverride)[]).forEach(k => merged[k] === undefined && delete merged[k]);
+         if (Object.keys(merged).length === 0) delete next[key];
+         else next[key] = merged;
+@@ -1187,6 +1198,9 @@ export default function EditorPage() {
+       // Salvage overrides orphaned by an older build that re-keyed segments without migrating:
+       // a key that is a non-head word of some saved segment moves back to that segment's head.
+       setLineOverrides(reanchorLineOverrideKeys(s.captionSegments ?? [], migrateSnapshotOverrides(s)));
++      // Auto-placed boxes came back inside lineOverrides (boxAuto), so the preview/export honour them
++      // immediately; the face analysis re-runs in the background and only re-places on a change.
++      setKeepOffFaces(!!s.keepCaptionsOffFaces);
+       if (typeof s.captionGapMs === 'number') setCaptionGapMs(s.captionGapMs);
+       setCaptionCustomFont(s.captionCustomFont ?? null);
+       setCustomFontData(s.customFontData ?? null);
+@@ -1731,6 +1745,7 @@ export default function EditorPage() {
+     captionGapMs, captionCustomFont, customFontIsCustom,
+     customFontData: customFontData ?? undefined,
+     textOverrides, emphasisStyle, layoutMode, lineOverrides, templateSlots,
++    keepCaptionsOffFaces: keepOffFaces,
+   }), [
+     words, srtNative, transcript, durationMs, captionSegments, captionStyle,
+     dominantColor, accentColor, captionTextColor, captionYPercent,
+@@ -1739,6 +1754,7 @@ export default function EditorPage() {
+     segmentStyleOverrides, bleepRanges, captionGapMs, captionCustomFont,
+     customFontIsCustom, customFontData,
+     textOverrides, emphasisStyle, layoutMode, lineOverrides, templateSlots,
++    keepOffFaces,
+   ]);
+ 
+   // Ask the browser to persist our storage so the captik IndexedDB (snapshots +
+@@ -1934,6 +1950,7 @@ export default function EditorPage() {
+     setCaptionEmphBox({ xPercent: 50, yPercent: 24, widthPercent: 84 });
+     setEmphFontScale(1);
+     setLineOverrides({});
++    setKeepOffFaces(false);
+     setTextOverrides({});
+     setEmphasisStyle({});
+     setTemplateSlots({});
+@@ -2067,6 +2084,76 @@ export default function EditorPage() {
+     sourceSig:  videoURL || null,
+     enabled:    phase === 'ready' && words.length > 0,
+   });
++
++  // ── "Keep captions off faces" ────────────────────────────────────────────────
++  // Each caption whose default position would cover the speaker's face gets an AUTOMATIC per-line box
++  // (lineOverrides[key].box, flagged boxAuto) — the override the preview and every export path already
++  // resolve by segment key, so no renderer changes. Manual boxes are never touched. The face is found
++  // by a separate, sparse sampler rather than the subject matte above: ANY SubjectMatte is drawn over
++  // the captions and reroutes the export (see lib/matte/faceGridSampler.ts).
++  const faceSegments = useMemo(() => resolveSegments(captionSegments, words), [captionSegments, words]);
++  const faceSampleTimes = useMemo(
++    () => (keepOffFaces ? faceAwareSampleTimes(faceSegments, captionGapMs, durationMs) : []),
++    [keepOffFaces, faceSegments, captionGapMs, durationMs],
++  );
++  const faceGrids = useFaceGrids({
++    videoSrc: videoURL || null,
++    enabled:  keepOffFaces && phase === 'ready' && words.length > 0,
++    times:    faceSampleTimes,
++  });
++  const faceCanvas = useMemo(() => logicalCanvasSize(aspectValue(aspectRatio, videoDims)), [aspectRatio, videoDims]);
++  const faceSourceAspect = videoDims && videoDims.h ? videoDims.w / videoDims.h : faceCanvas.w / faceCanvas.h;
++  // What placement READS from the overrides (manual boxes + per-line sizes) — so it re-runs on a
++  // manual edit but not on its own auto writes.
++  const faceOverrideSig = useMemo(() => faceAwareOverrideSig(lineOverrides), [lineOverrides]);
++  const faceAutoCount   = useMemo(() => countAutoBoxes(lineOverrides), [lineOverrides]);
++  // Latest overrides for the debounced placement below (same mirror pattern as behindSubjectTargetRef).
++  const lineOverridesRef = useRef(lineOverrides);
++  useEffect(() => { lineOverridesRef.current = lineOverrides; });
++  // Why each caption sits where it does — drives the panel's wording (a caption that covers a face
++  // with nowhere clear to go must not be reported as "no caption covers a face").
++  const [faceStats, setFaceStats] = useState<FaceAwareCounts | null>(null);
++  useEffect(() => {
++    // Debounced: a Size slider or box drag fires a burst of changes, and every reconcile is a
++    // lineOverrides write (which autosaves the snapshot).
++    const t = setTimeout(() => {
++      if (!keepOffFaces) {
++        // Also catches auto boxes brought back by an undo while the toggle is off.
++        if (faceAutoCount > 0) setLineOverrides(prev => removeAutoBoxes(prev));
++        setFaceStats(null);
++        return;
++      }
++      // Until the analysis covers every caption, keep the auto boxes that are already there (e.g.
++      // restored from the snapshot) instead of dropping them.
++      if (faceGrids.status !== 'ready') return;
++      const details = planFaceAwareDetails({
++        overrides: lineOverridesRef.current, segments: faceSegments, captionGapMs, durationMs,
++        grids: faceGrids.grids, defaultBox: captionBox, fontScale: captionFontScale, captionLines,
++        canvasW: faceCanvas.w, canvasH: faceCanvas.h, sourceAspect: faceSourceAspect,
++      });
++      const counts = faceAwareCounts(details);
++      console.info('[face-aware] placed', counts);
++      setFaceStats(counts);
++      // applyFaceDetails re-checks every line's manual flag against the CURRENT map, so a position
++      // the user set while this was being computed still wins.
++      setLineOverrides(prev => applyFaceDetails(prev, details, captionBox));
++    }, 150);
++    return () => clearTimeout(t);
++  }, [keepOffFaces, faceAutoCount, faceGrids.status, faceGrids.grids, faceSegments, captionGapMs, durationMs,
++      captionBox, captionFontScale, captionLines, faceCanvas, faceSourceAspect, faceOverrideSig]);
++  const handleKeepOffFacesChange = useCallback((on: boolean) => {
++    setKeepOffFaces(on);
++    // OFF drops only the automatic boxes, immediately; the user's own positions stay.
++    if (!on) setLineOverrides(prev => removeAutoBoxes(prev));
++  }, []);
++  const faceAwareControl: FaceAwareControl = {
++    on:         keepOffFaces,
++    onChange:   handleKeepOffFacesChange,
++    status:     keepOffFaces ? (faceGrids.status === 'idle' ? 'analyzing' : faceGrids.status) : 'idle',
++    progress:     faceGrids.progress,
++    movedCount:   faceAutoCount,
++    blockedCount: faceStats?.blocked ?? 0,
++  };
+   // The caption the toggle targets when nothing is selected and the playhead isn't exactly on a
+   // caption: the NEAREST caption to the playhead — so the per-caption toggle ALWAYS has one clear
+   // target (never disabled when captions exist), while staying per-caption (never global).
+@@ -2649,14 +2736,16 @@ export default function EditorPage() {
+   // Drop the given per-line override fields from EVERY line (keeps styles/colours) — used when a
+   // global position/size change should win everywhere.
+   const clearAllLineFields = useCallback((fields: (keyof LineOverride)[]) => {
++    // A box's auto/manual flag goes with the box.
++    const drop: (keyof LineOverride)[] = fields.includes('box') ? [...fields, 'boxAuto'] : fields;
+     setLineOverrides(prev => {
+       let changed = false;
+       const next: Record<string, LineOverride> = {};
+       for (const [k, o] of Object.entries(prev)) {
+-        if (fields.some(f => o[f] !== undefined)) {
++        if (drop.some(f => o[f] !== undefined)) {
+           changed = true;
+           const rest = { ...o };
+-          for (const f of fields) delete rest[f];
++          for (const f of drop) delete rest[f];
+           if (Object.keys(rest).length) next[k] = rest;
+         } else next[k] = o;
+       }
+@@ -2735,11 +2824,13 @@ export default function EditorPage() {
+     if (pendingBox == null && pendingFontScale == null) return;
+     const r = resolveDismissedScopeGesture({
+       selectedCount: selectedSegmentKeys.length,
+-      overrideCount: Object.keys(segmentBoxOverrides).length + Object.keys(segmentFontScaleOverrides).length,
++      // Only the user's own boxes make an 'all' commit lossy — "Keep captions off faces" re-derives
++      // its automatic boxes from the new global box.
++      overrideCount: countManualBoxes(lineOverrides) + Object.keys(segmentFontScaleOverrides).length,
+     });
+     if (r === 'cancel') handleCaptionBoxCancel();
+     else handleCaptionBoxScope(r === 'commit-block' ? 'block' : 'all');
+-  }, [pendingBox, pendingFontScale, selectedSegmentKeys, segmentBoxOverrides, segmentFontScaleOverrides,
++  }, [pendingBox, pendingFontScale, selectedSegmentKeys, lineOverrides, segmentFontScaleOverrides,
+       handleCaptionBoxScope, handleCaptionBoxCancel]);
+ 
+   // ── "Big Reveal" TITLE box handlers — exact mirror of the lower-caption box above ──
+@@ -4432,6 +4523,7 @@ export default function EditorPage() {
+       captionXPercent={positionFieldBox.xPercent}
+       onPositionChange={handlePositionChange}
+       positionScopeCount={selectedSegmentKeys.length}
++      faceAware={faceAwareControl}
+       textOverrides={textOverrides}
+       onTextOverrides={patchTextOverrides}
+       emphasisStyle={emphasisStyle}
+diff --git a/src/components/editor/RightPanel.tsx b/src/components/editor/RightPanel.tsx
+index 4e792ba..af75e94 100644
+--- a/src/components/editor/RightPanel.tsx
++++ b/src/components/editor/RightPanel.tsx
+@@ -10,7 +10,7 @@ import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
+ import type { TextOverrides, EmphasisStyle, LayoutMode, TemplateSlotOverrides } from '@/types/transcript';
+ import type { StylePreset } from '@/lib/presetStore';
+ import type { FontSelection } from './FontsPanel';
+-import TextTab from './panel/TextTab';
++import TextTab, { type FaceAwareControl } from './panel/TextTab';
+ import TemplatesTab from './panel/TemplatesTab';
+ import Tooltip from '@/components/ui/Tooltip';
+ 
+@@ -27,6 +27,8 @@ interface RightPanelProps {
+   onPositionChange:         (x: number, y: number) => void;
+   /** Captions selected in the timeline — when >0 the Position fields move ONLY those. */
+   positionScopeCount?:      number;
++  /** "Keep captions off faces" toggle (Text → Position). */
++  faceAware?:               FaceAwareControl;
+   captionFontScale:         number;
+   onCaptionFontScaleChange: (v: number) => void;
+   /** Big Reveal only: independent title font scale + setter. */
+@@ -108,6 +110,7 @@ export default function RightPanel(p: RightPanelProps) {
+             captionYPercent={p.captionYPercent}
+             onPositionChange={p.onPositionChange}
+             positionScopeCount={p.positionScopeCount ?? 0}
++            faceAware={p.faceAware}
+             selectedFont={p.selectedFont ?? null}
+             onFontSelect={sel => p.onFontSelect?.(sel)}
+             templateSlots={p.templateSlots}
+diff --git a/src/components/editor/panel/TextTab.tsx b/src/components/editor/panel/TextTab.tsx
+index 7c3f1e6..a510be2 100644
+--- a/src/components/editor/panel/TextTab.tsx
++++ b/src/components/editor/panel/TextTab.tsx
+@@ -55,6 +55,8 @@ export interface TextTabProps {
+   onPositionChange: (x: number, y: number) => void;
+   /** Captions selected in the timeline — when >0 these fields move ONLY those captions. */
+   positionScopeCount?: number;
++  /** "Keep captions off faces" toggle + its analysis state (shown under Position). */
++  faceAware?: FaceAwareControl;
+   selectedFont: string | null;
+   onFontSelect: (sel: FontSelection | null) => void;
+   /** Per-template slot overrides (editor_masala/illusion/aura) + patch callback. */
+@@ -93,6 +95,7 @@ export default function TextTab(p: TextTabProps) {
+         captionYPercent={p.captionYPercent}
+         onPositionChange={p.onPositionChange}
+         positionScopeCount={p.positionScopeCount ?? 0}
++        faceAware={p.faceAware}
+       />
+     );
+   }
+@@ -185,6 +188,7 @@ export default function TextTab(p: TextTabProps) {
+             onReset={() => p.onPositionChange(p.captionXPercent, 85)} showReset={p.captionYPercent !== 85} />
+         </div>
+         <ScopeHint count={p.positionScopeCount ?? 0} />
++        {p.faceAware && <FaceAwareToggle control={p.faceAware} />}
+       </Section>
+ 
+       {/* ── COLOR ─────────────────────────────────────────────── */}
+@@ -775,10 +779,46 @@ function ScopeHint({ count, verb = 'Moves' }: { count: number; verb?: string })
+   );
+ }
+ 
++/** State + setter for the "Keep captions off faces" toggle. */
++export interface FaceAwareControl {
++  on:         boolean;
++  onChange:   (on: boolean) => void;
++  status:     'idle' | 'analyzing' | 'ready' | 'error' | 'unsupported';
++  /** 0–1 while analysing. */
++  progress:   number;
++  /** Captions currently moved automatically. */
++  movedCount: number;
++  /** Captions that DO cover a face but have nowhere clear to go (the subject fills the frame). */
++  blockedCount: number;
++}
++
++/** Position-section toggle: moves a caption vertically only when it would cover the speaker's face. */
++function FaceAwareToggle({ control: c }: { control: FaceAwareControl }) {
++  const hint = !c.on
++    ? 'Moves a caption up or down only when it would cover the speaker’s face. Captions you place yourself stay put.'
++    : c.status === 'unsupported' ? 'Finding faces needs desktop Google Chrome.'
++    : c.status === 'error'       ? 'Couldn’t find faces in this clip — try a clear, well-lit video.'
++    : c.status === 'ready'
++      ? (c.movedCount > 0
++        ? `${c.movedCount} caption${c.movedCount === 1 ? '' : 's'} moved off faces. Drag one to place it yourself.`
++        : c.blockedCount > 0
++          ? `${c.blockedCount} caption${c.blockedCount === 1 ? '' : 's'} can’t clear the face here — left where you put them.`
++          : 'No caption covers a face.')
++    : `Finding faces… ${Math.round(c.progress * 100)}%`;
++  return (
++    <div className="mt-2.5 pt-2 border-t border-white/[0.05]" data-face-aware={c.status}>
++      <ToggleRow label="Keep captions off faces" on={c.on} onChange={c.onChange} />
++      <p className={`text-[10px] mt-0.5 leading-tight ${c.on && (c.status === 'error' || c.status === 'unsupported') ? 'text-amber-300/90' : 'text-zinc-500'}`}>
++        {hint}
++      </p>
++    </div>
++  );
++}
++
+ function TemplateSlotsEditor({
+   captionStyle, slots, onSlot,
+   captionFontScale, onCaptionFontScaleChange,
+-  captionXPercent, captionYPercent, onPositionChange, positionScopeCount = 0,
++  captionXPercent, captionYPercent, onPositionChange, positionScopeCount = 0, faceAware,
+ }: {
+   captionStyle: CaptionStyleId;
+   slots: TemplateSlotOverrides;
+@@ -789,6 +829,7 @@ function TemplateSlotsEditor({
+   captionYPercent: number;
+   onPositionChange: (x: number, y: number) => void;
+   positionScopeCount?: number;
++  faceAware?: FaceAwareControl;
+ }) {
+   const sizePx = Math.round(captionFontScale * BASE_FONT_PX);
+   return (
+@@ -831,6 +872,7 @@ function TemplateSlotsEditor({
+             onReset={() => onPositionChange(captionXPercent, 85)} showReset={captionYPercent !== 85} />
+         </div>
+         <ScopeHint count={positionScopeCount} />
++        {faceAware && <FaceAwareToggle control={faceAware} />}
+       </Section>
+     </div>
+   );
+diff --git a/src/hooks/useFaceGrids.ts b/src/hooks/useFaceGrids.ts
+new file mode 100644
+index 0000000..486a82a
+--- /dev/null
++++ b/src/hooks/useFaceGrids.ts
+@@ -0,0 +1,80 @@
++'use client';
++
++// "Keep captions off faces" — analyses the face at the instants caption placement needs and keeps
++// the grids cached per source, so a caption edit only analyses the instants it adds (samples sit on
++// a fixed time grid, see SAMPLE_STEP_MS). Grids live in memory only; the placed boxes themselves are
++// persisted in the project snapshot, so a reload keeps them while this re-analyses in the background.
++
++import { useEffect, useRef, useState } from 'react';
++import type { CoverageGrid } from '@/lib/faceAware/faceGrid';
++
++export type FaceGridStatus = 'idle' | 'analyzing' | 'ready' | 'error' | 'unsupported';
++
++export interface UseFaceGridsArgs {
++  videoSrc: string | null;
++  enabled:  boolean;
++  /** Instants to analyse (ms) — faceAwareSampleTimes(...). */
++  times:    number[];
++}
++
++export interface UseFaceGridsResult {
++  status:   FaceGridStatus;
++  /** 0–1 over the instants still being analysed. */
++  progress: number;
++  /** Every analysed instant for the current source (a new Map whenever it changes). */
++  grids:    ReadonlyMap<number, CoverageGrid>;
++}
++
++const DEBOUNCE_MS = 400;
++
++export function useFaceGrids({ videoSrc, enabled, times }: UseFaceGridsArgs): UseFaceGridsResult {
++  const [state, setState] = useState<UseFaceGridsResult>({ status: 'idle', progress: 0, grids: new Map() });
++  const cacheRef = useRef<{ src: string | null; grids: Map<number, CoverageGrid> }>({ src: null, grids: new Map() });
++  // Stable dependency for the instant list (a new array every render upstream).
++  const timesKey = times.join(',');
++
++  useEffect(() => {
++    const wanted = timesKey ? timesKey.split(',').map(Number) : [];
++    const ac = new AbortController();
++    const timer = setTimeout(() => {
++      if (!enabled || !videoSrc) {
++        setState(s => (s.status === 'idle' ? s : { ...s, status: 'idle', progress: 0 }));
++        return;
++      }
++      if (cacheRef.current.src !== videoSrc) cacheRef.current = { src: videoSrc, grids: new Map() };
++      const cache = cacheRef.current.grids;
++      const publish = (status: FaceGridStatus, progress: number) =>
++        setState({ status, progress, grids: new Map(cache) });
++      const missing = wanted.filter(t => !cache.has(t));
++      if (!missing.length) { publish('ready', 1); return; }
++
++      void (async () => {
++        const { sampleFaceGrids, canSampleFaceGrids } = await import('@/lib/matte/faceGridSampler');
++        if (ac.signal.aborted) return;
++        if (!canSampleFaceGrids()) { publish('unsupported', 0); return; }
++        publish('analyzing', 0);
++        let done = 0;
++        try {
++          await sampleFaceGrids({
++            videoSrc, times: missing, signal: ac.signal,
++            onGrid: (t, grid) => {
++              cache.set(t, grid);
++              done++;
++              if (!ac.signal.aborted) setState(s => ({ ...s, progress: done / missing.length }));
++            },
++          });
++          if (ac.signal.aborted) return;
++          console.info('[face-aware] analysed', { instants: missing.length, cached: cache.size });
++          publish('ready', 1);
++        } catch (e) {
++          if ((e as Error)?.name === 'AbortError' || ac.signal.aborted) return;
++          console.warn('[face-aware] analysis failed', e);
++          publish('error', 0);
++        }
++      })();
++    }, enabled ? DEBOUNCE_MS : 0);
++    return () => { clearTimeout(timer); ac.abort(); };
++  }, [enabled, videoSrc, timesKey]);
++
++  return state;
++}
+diff --git a/src/lib/captionSegments.ts b/src/lib/captionSegments.ts
+index 53c1c63..c937be2 100644
+--- a/src/lib/captionSegments.ts
++++ b/src/lib/captionSegments.ts
+@@ -113,17 +113,32 @@ export function activeSegmentWindowAt(
+   tMs:          number,
+   captionGapMs: number = 0,
+ ): SegmentWindow | null {
+-  const LEAD = 80;
+-  const TAIL = Math.max(120, 120 + captionGapMs);
+   for (let i = 0; i < resolved.length; i++) {
+-    const cur = resolved[i], prev = resolved[i - 1], next = resolved[i + 1];
+-    const winStart = Math.max(cur.startMs - LEAD, prev ? prev.endMs : -Infinity);
+-    const winEnd   = Math.min(cur.endMs + TAIL, next ? next.startMs : Infinity);
++    const { winStart, winEnd } = segmentDisplayWindow(resolved, i, captionGapMs);
+     if (tMs >= winStart && tMs <= winEnd) return { index: i, winStart, winEnd };
+   }
+   return null;
+ }
+ 
++/**
++ * The display window of segment `i` — the exact instants it appears and clears on screen. The one
++ * formula activeSegmentWindowAt scans with, exported so code that reasons about a caption's whole
++ * on-screen span (face-aware placement samples inside it) can't drift from what is displayed.
++ */
++export function segmentDisplayWindow(
++  resolved:     ResolvedSegment[],
++  i:            number,
++  captionGapMs: number = 0,
++): { winStart: number; winEnd: number } {
++  const LEAD = 80;
++  const TAIL = Math.max(120, 120 + captionGapMs);
++  const cur = resolved[i], prev = resolved[i - 1], next = resolved[i + 1];
++  return {
++    winStart: Math.max(cur.startMs - LEAD, prev ? prev.endMs : -Infinity),
++    winEnd:   Math.min(cur.endMs + TAIL, next ? next.startMs : Infinity),
++  };
++}
++
+ export function activeSegmentIndexAt(
+   resolved:     ResolvedSegment[],
+   tMs:          number,
+diff --git a/src/lib/faceAware/captionPlacement.spec.ts b/src/lib/faceAware/captionPlacement.spec.ts
+new file mode 100644
+index 0000000..e104289
+--- /dev/null
++++ b/src/lib/faceAware/captionPlacement.spec.ts
+@@ -0,0 +1,342 @@
++import { describe, it, expect } from 'vitest';
++import type { TranscriptWord, LineOverride, CaptionBoxConfig } from '@/types/transcript';
++import { resolveSegments, activeSegmentWindowAt, segmentDisplayWindow, type ResolvedSegment } from '@/lib/captionSegments';
++import { migrateSegmentOverrideKeys } from '@/lib/captionEdits';
++import {
++  planFaceAwarePlacement, planFaceAwareDetails, faceAwareCounts, reconcileFaceAwareBoxes, removeAutoBoxes, markBoxPatchManual,
++  lineSampleTimes, faceAwareSampleTimes, containRect, integrateGrid, gridRectMass, hiddenFaceShare,
++  estimateCaptionBlock, blockRectAt, isManualBox, countAutoBoxes, countManualBoxes, faceAwareOverrideSig,
++  fallbackAcceptable, CLEAR_COVERAGE, SAFE_TOP_FRAC, SAFE_BOTTOM_FRAC,
++  FALLBACK_MAX_COVERAGE, FALLBACK_MIN_IMPROVEMENT, type FaceAwareInput,
++} from './captionPlacement';
++import { GRID_COLS, GRID_ROWS, type CoverageGrid } from './faceGrid';
++
++// 9:16 logical caption canvas (logicalCanvasSize(9/16)) over a 9:16 source — identity mapping.
++const W = 270, H = 480;
++const DEFAULT_BOX: CaptionBoxConfig = { xPercent: 50, yPercent: 85, widthPercent: 84 };
++const DURATION = 10_000;
++
++type Rect = { left: number; top: number; right: number; bottom: number };
++const FACE_HIGH:  Rect = { left: 0.35, top: 0.20, right: 0.65, bottom: 0.45 };   // talking head, face up top
++const FACE_LOW:   Rect = { left: 0.30, top: 0.62, right: 0.70, bottom: 0.95 };   // face right where captions go
++const FACE_LOWER: Rect = { left: 0.30, top: 0.70, right: 0.70, bottom: 0.95 };
++
++const word = (id: string, text: string, startMs: number, endMs: number) =>
++  ({ id, text, startMs, endMs }) as TranscriptWord;
++
++/** A face rectangle (fractions of the source frame) painted into a 54×96 grid by cell centre. */
++function paintFace(rect?: Rect): CoverageGrid {
++  const data = new Float32Array(GRID_COLS * GRID_ROWS);
++  if (rect) {
++    for (let r = 0; r < GRID_ROWS; r++) {
++      const cy = (r + 0.5) / GRID_ROWS;
++      if (cy < rect.top || cy > rect.bottom) continue;
++      for (let c = 0; c < GRID_COLS; c++) {
++        const cx = (c + 0.5) / GRID_COLS;
++        if (cx >= rect.left && cx <= rect.right) data[r * GRID_COLS + c] = 1;
++      }
++    }
++  }
++  return { cols: GRID_COLS, rows: GRID_ROWS, data };
++}
++const fullGrid = (): CoverageGrid => ({ cols: GRID_COLS, rows: GRID_ROWS, data: new Float32Array(GRID_COLS * GRID_ROWS).fill(1) });
++
++/** Several blobs at once — e.g. the head plus the speaker's own forearm, which the model reads as skin. */
++function paintMany(rects: Rect[]): CoverageGrid {
++  const data = new Float32Array(GRID_COLS * GRID_ROWS);
++  for (const rect of rects) {
++    for (let r = 0; r < GRID_ROWS; r++) {
++      const cy = (r + 0.5) / GRID_ROWS;
++      if (cy < rect.top || cy > rect.bottom) continue;
++      for (let c = 0; c < GRID_COLS; c++) {
++        const cx = (c + 0.5) / GRID_COLS;
++        if (cx >= rect.left && cx <= rect.right) data[r * GRID_COLS + c] = 1;
++      }
++    }
++  }
++  return { cols: GRID_COLS, rows: GRID_ROWS, data };
++}
++
++/** Two captions: A = "this is line" 0–1000 ms, B = "second caption" starting at bStart. */
++function fixture(bStart = 1100): ResolvedSegment[] {
++  const words = [
++    word('a1', 'this', 0, 400), word('a2', 'is', 400, 600), word('a3', 'line', 600, 1000),
++    word('b1', 'second', bStart, bStart + 400), word('b2', 'caption', bStart + 400, bStart + 900),
++  ];
++  return resolveSegments([['a1', 'a2', 'a3'], ['b1', 'b2']], words);
++}
++
++/** A grid for every instant the placement will read. */
++function gridsFor(segments: ResolvedSegment[], paint: (tMs: number) => CoverageGrid) {
++  const m = new Map<number, CoverageGrid>();
++  for (const t of faceAwareSampleTimes(segments, 0, DURATION)) m.set(t, paint(t));
++  return m;
++}
++
++function input(o: Partial<FaceAwareInput> & Pick<FaceAwareInput, 'segments' | 'grids'>): FaceAwareInput {
++  return {
++    overrides: {}, captionGapMs: 0, durationMs: DURATION, defaultBox: DEFAULT_BOX, fontScale: 1,
++    captionLines: 'single', canvasW: W, canvasH: H, sourceAspect: 9 / 16, ...o,
++  };
++}
++
++function blockFor(text: string) {
++  return estimateCaptionBlock({ text, fontScale: 1, captionLines: 'single', widthPercent: DEFAULT_BOX.widthPercent, canvasW: W, canvasH: H });
++}
++
++describe('planFaceAwarePlacement', () => {
++  it('face in the upper half → the caption stays at its default (no override written)', () => {
++    const segments = fixture();
++    const grids = gridsFor(segments, () => paintFace(FACE_HIGH));
++    const plan = planFaceAwarePlacement(input({ segments, grids }));
++    expect(plan).toEqual({ a1: null, b1: null });
++    expect(reconcileFaceAwareBoxes(input({ segments, grids }))).toEqual({});
++  });
++
++  it('face low → the caption moves up, above the face, inside the platform-safe band', () => {
++    const segments = fixture();
++    const grids = gridsFor(segments, () => paintFace(FACE_LOW));
++    const plan = planFaceAwarePlacement(input({ segments, grids }));
++    const y = plan.a1;
++    expect(typeof y).toBe('number');
++    const size = blockFor('this is line');
++    const textTop = y! / 100 - size.height / 2;
++    const textBottom = y! / 100 + size.height / 2;
++    expect(textTop).toBeGreaterThanOrEqual(SAFE_TOP_FRAC);
++    expect(textBottom).toBeLessThanOrEqual(1 - SAFE_BOTTOM_FRAC);
++    expect(textBottom).toBeLessThanOrEqual(FACE_LOW.top);          // the caption's text sits above the face
++    const share = hiddenFaceShare(integrateGrid(grids.get(0)!), blockRectAt(size, 50, y!), { x: 0, y: 0, w: 1, h: 1 });
++    expect(share).toBeLessThanOrEqual(CLEAR_COVERAGE);
++    // …and it moves only as far as it has to: the nearest clear spot, not the top of the frame.
++    expect(y!).toBeGreaterThan(45);
++  });
++
++  it('subject covers the whole frame → nothing clears, so the default is kept', () => {
++    const segments = fixture();
++    const grids = gridsFor(segments, () => fullGrid());
++    expect(planFaceAwarePlacement(input({ segments, grids }))).toEqual({ a1: null, b1: null });
++  });
++
++  it('back-to-back captions hold a steady height instead of hopping; distant ones are placed independently', () => {
++    const paint = (t: number) => paintFace(t < 1100 ? FACE_LOW : FACE_LOWER);
++    const near = fixture(1100);
++    const nearPlan = planFaceAwarePlacement(input({ segments: near, grids: gridsFor(near, paint) }));
++    expect(typeof nearPlan.a1).toBe('number');
++    expect(typeof nearPlan.b1).toBe('number');
++    expect(Math.abs(nearPlan.b1! - nearPlan.a1!)).toBeLessThanOrEqual(3);
++
++    // Same faces, but B appears 5 s later — no stability pull, so B sits nearer its default.
++    const far = fixture(6000);
++    const farPlan = planFaceAwarePlacement(input({ segments: far, grids: gridsFor(far, t => paintFace(t < 1100 ? FACE_LOW : FACE_LOWER)) }));
++    expect(farPlan.a1).toBe(nearPlan.a1);
++    expect(farPlan.b1!).toBeGreaterThan(nearPlan.a1! + 3);
++  });
++
++  it('when nothing clears, still moves to a position that hides far less of the face', () => {
++    // The real shape of the problem: a head high in the frame AND the speaker's forearm running down
++    // the lower half (the model reads that skin as face). Every position in the band touches one of
++    // them, so nothing "clears" — but below the head only the narrow forearm is under the caption,
++    // which hides a fraction of what the default does.
++    const HEAD = { left: 0.28, top: 0.18, right: 0.72, bottom: 0.50 };
++    const ARM  = { left: 0.45, top: 0.52, right: 0.52, bottom: 0.98 };   // inside the caption's width
++    const segments = fixture();
++    const grids = gridsFor(segments, () => paintMany([HEAD, ARM]));
++    const centred: CaptionBoxConfig = { xPercent: 50, yPercent: 33, widthPercent: 84 };
++    const details = planFaceAwareDetails(input({ segments, grids, defaultBox: centred }));
++    const y = details.a1.y;
++    expect(details.a1.reason).toBe('moved-partial');
++    expect(typeof y).toBe('number');
++    const size = blockFor('this is line');
++    const sat = integrateGrid(grids.get(0)!);
++    const full = { x: 0, y: 0, w: 1, h: 1 };
++    const atDefault = hiddenFaceShare(sat, blockRectAt(size, 50, centred.yPercent), full);
++    const atChosen  = hiddenFaceShare(sat, blockRectAt(size, 50, y!), full);
++    expect(atDefault).toBeGreaterThan(CLEAR_COVERAGE);
++    expect(atChosen).toBeGreaterThan(CLEAR_COVERAGE);              // not clear…
++    expect(atChosen).toBeLessThanOrEqual(FALLBACK_MAX_COVERAGE);   // …but not on the face either
++    expect(atChosen).toBeLessThanOrEqual(atDefault - FALLBACK_MIN_IMPROVEMENT);
++  });
++
++  it('the fallback refuses a least-bad position that is still on the face, or barely better', () => {
++    expect(fallbackAcceptable(0.05, 0.40)).toBe(true);    // decisively better, and off the face
++    expect(fallbackAcceptable(0.15, 0.40)).toBe(false);   // 25 pt better, but still on the face
++    expect(fallbackAcceptable(0.08, 0.20)).toBe(false);   // off the face, but only 12 pt better
++    expect(fallbackAcceptable(0.30, 0.31)).toBe(false);
++  });
++
++  it('never moves a caption the user positioned by hand', () => {
++    const segments = fixture();
++    const grids = gridsFor(segments, () => paintFace(FACE_LOW));
++    const manual: CaptionBoxConfig = { xPercent: 50, yPercent: 80, widthPercent: 84 };
++    const overrides: Record<string, LineOverride> = { a1: { box: manual, styleId: 'hormozi' } };
++    const plan = planFaceAwarePlacement(input({ segments, grids, overrides }));
++    expect('a1' in plan).toBe(false);
++    const next = reconcileFaceAwareBoxes(input({ segments, grids, overrides }));
++    expect(next.a1).toEqual({ box: manual, styleId: 'hormozi' });
++    expect(isManualBox(next.a1)).toBe(true);
++    expect(next.b1?.boxAuto).toBe(true);               // its neighbour is still placed automatically
++  });
++
++  it('a letterboxed video: caption over the black bar never counts as covering the face', () => {
++    // 16:9 source in a 9:16 canvas → the video is a band in the middle (y 34%–66%); the default caption
++    // at 85% sits on black, however low the face is inside the source frame.
++    const segments = fixture();
++    const grids = gridsFor(segments, () => paintFace(FACE_LOW));
++    const plan = planFaceAwarePlacement(input({ segments, grids, sourceAspect: 16 / 9 }));
++    expect(plan).toEqual({ a1: null, b1: null });
++  });
++
++  it('reports WHY each caption sits where it does', () => {
++    const segments = fixture();
++    const manual: Record<string, LineOverride> = { b1: { box: { ...DEFAULT_BOX, yPercent: 30 } } };
++    const clear   = planFaceAwareDetails(input({ segments, grids: gridsFor(segments, () => paintFace(FACE_HIGH)) }));
++    const moved   = planFaceAwareDetails(input({ segments, grids: gridsFor(segments, () => paintFace(FACE_LOW)) }));
++    const blocked = planFaceAwareDetails(input({ segments, grids: gridsFor(segments, () => fullGrid()) }));
++    const mixed   = planFaceAwareDetails(input({ segments, grids: gridsFor(segments, () => paintFace(FACE_LOW)), overrides: manual }));
++    const pending = planFaceAwareDetails(input({ segments, grids: new Map() }));
++    expect(clear.a1.reason).toBe('clear-at-default');
++    expect(moved.a1.reason).toBe('moved');
++    expect(blocked.a1.reason).toBe('no-clear-spot');      // covers the face, but nothing clears it
++    expect(blocked.a1.y).toBe(null);                      // …so the default is kept
++    expect(mixed.b1.reason).toBe('manual');
++    expect(pending.a1.reason).toBe('unknown');
++    expect(faceAwareCounts(moved)).toEqual({ moved: 2, partial: 0, clear: 0, blocked: 0, manual: 0, pending: 0 });
++    expect(faceAwareCounts(blocked)).toEqual({ moved: 0, partial: 0, clear: 0, blocked: 2, manual: 0, pending: 0 });
++    expect(faceAwareCounts(mixed).manual).toBe(1);
++  });
++
++  it('leaves lines alone while their instants are not analysed yet', () => {
++    const segments = fixture();
++    const overrides: Record<string, LineOverride> = { a1: { box: { ...DEFAULT_BOX, yPercent: 40 }, boxAuto: true } };
++    const inp = input({ segments, grids: new Map(), overrides });
++    expect(planFaceAwarePlacement(inp)).toEqual({});
++    expect(reconcileFaceAwareBoxes(inp)).toBe(overrides);   // same reference — auto box survives a reload
++  });
++});
++
++describe('reconcileFaceAwareBoxes', () => {
++  it('writes auto boxes through the per-line override (x/width from the default) and is idempotent', () => {
++    const segments = fixture();
++    const grids = gridsFor(segments, () => paintFace(FACE_LOW));
++    const overrides: Record<string, LineOverride> = { b1: { styleId: 'mrbeast' } };
++    const next = reconcileFaceAwareBoxes(input({ segments, grids, overrides }));
++    expect(next.a1?.boxAuto).toBe(true);
++    expect(next.a1?.box?.xPercent).toBe(50);
++    expect(next.a1?.box?.widthPercent).toBe(84);
++    expect(next.b1?.styleId).toBe('mrbeast');
++    expect(next.b1?.boxAuto).toBe(true);
++    expect(reconcileFaceAwareBoxes(input({ segments, grids, overrides: next }))).toBe(next);
++  });
++
++  it('follows the default box and drops a stale auto box once the face moves away', () => {
++    const segments = fixture();
++    const low = reconcileFaceAwareBoxes(input({ segments, grids: gridsFor(segments, () => paintFace(FACE_LOW)) }));
++    const moved = reconcileFaceAwareBoxes(input({
++      segments, grids: gridsFor(segments, () => paintFace(FACE_LOW)), overrides: low,
++      defaultBox: { ...DEFAULT_BOX, xPercent: 46 },
++    }));
++    expect(moved.a1?.box?.xPercent).toBe(46);
++    const withStyle = { ...moved, a1: { ...moved.a1, styleId: 'hormozi' } };
++    const high = reconcileFaceAwareBoxes(input({ segments, grids: gridsFor(segments, () => paintFace(FACE_HIGH)), overrides: withStyle }));
++    expect(high).toEqual({ a1: { styleId: 'hormozi' } });
++  });
++
++  it('auto boxes survive the segment re-keying that used to orphan per-line overrides', () => {
++    const segments = fixture();
++    const placed = reconcileFaceAwareBoxes(input({ segments, grids: gridsFor(segments, () => paintFace(FACE_LOW)) }));
++    // Split A after its first word: the new caption headed by a2 must inherit the (auto) box.
++    const rekeyed = migrateSegmentOverrideKeys([['a1', 'a2', 'a3'], ['b1', 'b2']], [['a1'], ['a2', 'a3'], ['b1', 'b2']], placed);
++    expect(rekeyed.a2?.boxAuto).toBe(true);
++    expect(rekeyed.a2?.box).toEqual(placed.a1?.box);
++  });
++});
++
++describe('removeAutoBoxes (toggle OFF)', () => {
++  it('removes only automatic boxes, keeping manual boxes and every other per-line field', () => {
++    const manual: CaptionBoxConfig = { xPercent: 30, yPercent: 60, widthPercent: 70 };
++    const overrides: Record<string, LineOverride> = {
++      a: { box: { ...DEFAULT_BOX, yPercent: 50 }, boxAuto: true, styleId: 'hormozi' },
++      b: { box: manual },
++      c: { box: { ...DEFAULT_BOX, yPercent: 40 }, boxAuto: true },
++      d: { fontScale: 1.2 },
++    };
++    expect(countAutoBoxes(overrides)).toBe(2);
++    expect(countManualBoxes(overrides)).toBe(1);
++    expect(removeAutoBoxes(overrides)).toEqual({ a: { styleId: 'hormozi' }, b: { box: manual }, d: { fontScale: 1.2 } });
++  });
++
++  it('returns the same reference when there is nothing automatic', () => {
++    const overrides: Record<string, LineOverride> = { b: { box: DEFAULT_BOX } };
++    expect(removeAutoBoxes(overrides)).toBe(overrides);
++  });
++});
++
++describe('markBoxPatchManual', () => {
++  it('a user patch that sets or clears the box makes that position manual', () => {
++    expect(markBoxPatchManual({ box: DEFAULT_BOX })).toEqual({ box: DEFAULT_BOX, boxAuto: undefined });
++    expect(markBoxPatchManual({ box: undefined })).toEqual({ box: undefined, boxAuto: undefined });
++  });
++  it('leaves other patches and explicit auto writes alone', () => {
++    const style = { styleId: 'hormozi' };
++    expect(markBoxPatchManual(style)).toBe(style);
++    const auto = { box: DEFAULT_BOX, boxAuto: true };
++    expect(markBoxPatchManual(auto)).toBe(auto);
++  });
++});
++
++describe('faceAwareOverrideSig', () => {
++  it('changes with manual boxes and per-line font scale, not with auto boxes', () => {
++    const base: Record<string, LineOverride> = { a: { box: DEFAULT_BOX } };
++    const withAuto = { ...base, b: { box: { ...DEFAULT_BOX, yPercent: 50 }, boxAuto: true } };
++    expect(faceAwareOverrideSig(withAuto)).toBe(faceAwareOverrideSig(base));
++    expect(faceAwareOverrideSig({ ...base, c: { fontScale: 1.4 } })).not.toBe(faceAwareOverrideSig(base));
++    expect(faceAwareOverrideSig({ a: { box: { ...DEFAULT_BOX, yPercent: 70 } } })).not.toBe(faceAwareOverrideSig(base));
++  });
++});
++
++describe('sampling + geometry helpers', () => {
++  it('samples on the fixed grid inside the display window, thinned to at most 4', () => {
++    expect(lineSampleTimes(0, 1000, -80, 1100, DURATION)).toEqual([0, 400, 800]);
++    expect(lineSampleTimes(450, 600, 450, 600, DURATION)).toEqual([400]);          // shorter than a step
++    expect(lineSampleTimes(0, 5000, 0, 5000, DURATION)).toHaveLength(4);
++    expect(lineSampleTimes(9900, 10_500, 9900, 10_500, DURATION)).toEqual([9600]); // never past the end — the last real instant
++    expect(lineSampleTimes(9700, 9900, 9700, 9900, DURATION)).toEqual([9600]);
++    expect(lineSampleTimes(NaN, NaN, NaN, NaN, DURATION)).toEqual([]);
++  });
++
++  it('segmentDisplayWindow is the window activeSegmentWindowAt displays', () => {
++    const segments = fixture(1100);
++    segments.forEach((_, i) => {
++      const w = segmentDisplayWindow(segments, i, 0);
++      const mid = (Math.max(w.winStart, 0) + w.winEnd) / 2;
++      expect(activeSegmentWindowAt(segments, mid, 0)).toEqual({ index: i, ...w });
++    });
++  });
++
++  it('containRect letterboxes a wide source in a tall canvas and pillarboxes the reverse', () => {
++    const tall = containRect(16 / 9, 9 / 16);
++    expect(tall.w).toBe(1);
++    expect(tall.h).toBeCloseTo((9 / 16) / (16 / 9));
++    expect(tall.y).toBeCloseTo((1 - tall.h) / 2);
++    const wide = containRect(9 / 16, 16 / 9);
++    expect(wide.h).toBe(1);
++    expect(wide.x).toBeCloseTo((1 - wide.w) / 2);
++  });
++
++  it('grid integrals count partial cells by area', () => {
++    const g = integrateGrid({ cols: 2, rows: 2, data: new Float32Array([1, 1, 1, 1]) });
++    expect(g.total).toBe(4);
++    expect(gridRectMass(g, 0.5, 0, 1.5, 2)).toBeCloseTo(2);
++    expect(gridRectMass(g, 0.25, 0.25, 0.75, 0.75)).toBeCloseTo(0.25);
++  });
++
++  it('a wrapped two-line caption is taller than the same text on one fitted row', () => {
++    const text = 'this caption is long enough to need a second row in the box';
++    const single = estimateCaptionBlock({ text, fontScale: 1, captionLines: 'single', widthPercent: 84, canvasW: W, canvasH: H });
++    const double = estimateCaptionBlock({ text, fontScale: 1, captionLines: 'double', widthPercent: 84, canvasW: W, canvasH: H });
++    expect(double.height).toBeGreaterThan(single.height);
++    expect(single.width).toBeLessThanOrEqual(0.84);
++    const bigger = estimateCaptionBlock({ text: 'short', fontScale: 2, captionLines: 'single', widthPercent: 84, canvasW: W, canvasH: H });
++    expect(bigger.height).toBeGreaterThan(blockFor('short').height);
++  });
++});
+diff --git a/src/lib/faceAware/captionPlacement.ts b/src/lib/faceAware/captionPlacement.ts
+new file mode 100644
+index 0000000..9a8da67
+--- /dev/null
++++ b/src/lib/faceAware/captionPlacement.ts
+@@ -0,0 +1,531 @@
++// "Keep captions off faces" — PURE placement, unit-tested in captionPlacement.spec.ts.
++//
++// For every caption line, pick the vertical position (and ONLY the vertical position) that keeps
++// the caption block off the speaker's face, then express it through the EXISTING per-line box
++// override (lineOverrides[key].box). The preview and every export path already resolve that map by
++// the canonical segment key via activeSegmentIndexAt, so nothing downstream changes.
++//
++// Auto vs manual: an auto-written box carries `boxAuto: true`. A box without it is the user's own and
++// is never touched. The flag lives INSIDE the override bundle on purpose — every re-keying path
++// (migrateSegmentOverrideKeys / applyLineKeyMigration / reanchorLineOverrideKeys), undo snapshots and
++// the project snapshot then carry it along with the box, so "which boxes are automatic" can never
++// drift from the boxes themselves (the head-word-key orphaning landmine).
++//
++// Block size is ESTIMATED from text, not measured from the preview DOM. The preview only renders the
++// caption under the playhead, so measuring every line would mean seeking through the whole video;
++// the estimate reuses fitText's char-width table (the same one the overlay's fit guard uses), is
++// deterministic, and is padded with a clearance margin so small estimation error doesn't touch a face.
++
++import type { CaptionBoxConfig, LineOverride } from '@/types/transcript';
++import { segmentDisplayWindow, type ResolvedSegment } from '@/lib/captionSegments';
++import { estTextWidth, fitRowScale } from '@/lib/fitText';
++import type { CoverageGrid } from './faceGrid';
++
++export type { CoverageGrid } from './faceGrid';
++
++// ── Platform-safe band ────────────────────────────────────────────────────────────────────────────
++/** Top UI zone of Reels / Shorts / TikTok (account row, "Following", camera icons), as a fraction of
++ *  the canvas height. An auto-moved caption never enters it. */
++export const SAFE_TOP_FRAC = 0.12;
++/** Bottom UI zone (description, audio ticker, action buttons). An auto-moved caption never enters it.
++ *  The user's own default may sit here — it is kept whenever it is clear of the face. */
++export const SAFE_BOTTOM_FRAC = 0.20;
++
++// ── Sampling ──────────────────────────────────────────────────────────────────────────────────────
++/** Samples sit on a fixed global time grid so caption edits reuse already-analysed frames. */
++export const SAMPLE_STEP_MS = 400;
++/** At most this many sampled instants per caption line. */
++export const MAX_SAMPLES_PER_LINE = 4;
++
++// ── Cost ──────────────────────────────────────────────────────────────────────────────────────────
++/** A position "clears" the face when it hides at most this share of the face mass at every sample. */
++export const CLEAR_COVERAGE = 0.03;
++/** Cost per full canvas height moved away from the user's default Y. */
++export const DISTANCE_PENALTY = 0.05;
++/** Cost per full canvas height jumped relative to the previous caption (only for back-to-back lines). */
++export const STABILITY_PENALTY = 0.15;
++/** Lines further apart than this are not "consecutive" — no stability pull between them. */
++export const STABLE_GAP_MS = 1200;
++/** Candidates within this cost of the best count as equal; among them the smallest move wins. */
++export const NEAR_EQUAL_COST = 0.002;
++/** Face mass (in grid cells) below which a sample is treated as "no face" (segmentation noise). */
++export const MIN_FACE_MASS = 0.75;
++
++// ── Fallback for lines where NOTHING clears ───────────────────────────────────────────────────────
++// Coverage is scored on the WORST sampled instant, so a position that is clear for most of a line but
++// brushed once — e.g. the speaker's own forearm swings under the caption for a moment, and the model
++// reads that skin as face — scores above the clear bar and is thrown away. Measured on a close-up
++// selfie clip: one line sat at 23.7% / 38.1% / 29.3% hidden at its three instants while the bottom of
++// the safe band scored 5.4% / 0.0% / 1.1% — plainly better everywhere, yet "blocked".
++// So when nothing clears, take the least-covered position — but only when it is BOTH decisively
++// better than the user's own default AND not itself sitting on the face. On that clip a 10-point bar
++// moved 10 of 11 lines but parked two of them on the speaker's forehead (~9.5% hidden at EVERY
++// instant); these values moved only the two lines that had a genuinely good spot.
++/** The least-covered position must hide this much less of the face than the default to be worth it. */
++export const FALLBACK_MIN_IMPROVEMENT = 0.20;
++/** …and must itself hide no more than this, so a caption is never parked on a face. */
++export const FALLBACK_MAX_COVERAGE = 0.10;
++/** Positions within this of the least-covered one are equally good (then distance/stability decide). */
++export const FALLBACK_TOLERANCE = 0.01;
++
++/**
++ * Nothing clears the face: is the least-covered position worth moving to? PURE — the whole fallback
++ * decision in one place so its two guards can be unit-tested directly.
++ */
++export function fallbackAcceptable(bestCoverage: number, defaultCoverage: number): boolean {
++  return bestCoverage <= FALLBACK_MAX_COVERAGE
++    && bestCoverage <= defaultCoverage - FALLBACK_MIN_IMPROVEMENT;
++}
++/** Candidate Y step, in percent of canvas height. */
++export const Y_STEP_PERCENT = 1;
++
++// ── Caption block estimate (logical canvas px — the space CaptionOverlay's fonts are tuned in) ──
++/** Typical template row font at fontScale 1 (hormozi / mrbeast / most rows use sz(18)–sz(20)). */
++export const ROW_FONT_PX = 20;
++export const LINE_HEIGHT = 1.25;
++export const WORD_GAP_PX = 6;
++export const BLOCK_PAD_X_PX = 8;
++export const BLOCK_PAD_Y_PX = 5;
++/** Extra clearance kept between the caption block and the face (fractions of canvas W / H). */
++export const CLEARANCE_X = 0.01;
++export const CLEARANCE_Y = 0.015;
++const MAX_WRAP_ROWS = 3;
++
++// ──────────────────────────────────────────────────────────────────────────────────────────────────
++
++/** Rectangle as fractions (0–1) of the caption canvas. */
++export interface CanvasRect { left: number; top: number; right: number; bottom: number }
++/** Caption block size as fractions of the canvas, padding included, clearance excluded. */
++export interface BlockSize { width: number; height: number }
++
++/**
++ * Sample instants for one caption: grid points inside its display window, thinned evenly to
++ * MAX_SAMPLES_PER_LINE; a window shorter than one step gets the grid point nearest its middle.
++ */
++export function lineSampleTimes(
++  startMs: number, endMs: number, winStart: number, winEnd: number, durationMs: number,
++  stepMs = SAMPLE_STEP_MS, maxSamples = MAX_SAMPLES_PER_LINE,
++): number[] {
++  let a = Number.isFinite(winStart) ? winStart : startMs;
++  let b = Number.isFinite(winEnd) ? winEnd : endMs;
++  if (!(b >= a)) { a = startMs; b = endMs; }
++  if (!Number.isFinite(a) || !Number.isFinite(b) || b < a || stepMs <= 0) return [];
++  const lastT = durationMs > 0 ? Math.floor((durationMs - 1) / stepMs) * stepMs : Infinity;
++  const lo = Math.max(0, a);
++  const hi = Math.min(b, lastT);
++  const pts: number[] = [];
++  for (let t = Math.ceil(lo / stepMs) * stepMs; t <= hi; t += stepMs) pts.push(t);
++  if (!pts.length) {
++    const t = Math.round((a + b) / 2 / stepMs) * stepMs;
++    return [Math.max(0, Math.min(lastT, t))];
++  }
++  if (pts.length <= maxSamples) return pts;
++  const out: number[] = [];
++  for (let k = 0; k < maxSamples; k++) {
++    const t = pts[Math.min(pts.length - 1, Math.floor(((k + 0.5) * pts.length) / maxSamples))];
++    if (out[out.length - 1] !== t) out.push(t);
++  }
++  return out;
++}
++
++/** Every instant the placement reads for these captions — sorted, unique. What the sampler analyses. */
++export function faceAwareSampleTimes(
++  segments: ResolvedSegment[], captionGapMs: number, durationMs: number,
++): number[] {
++  const set = new Set<number>();
++  for (let i = 0; i < segments.length; i++) {
++    const { winStart, winEnd } = segmentDisplayWindow(segments, i, captionGapMs);
++    for (const t of lineSampleTimes(segments[i].startMs, segments[i].endMs, winStart, winEnd, durationMs)) set.add(t);
++  }
++  return [...set].sort((x, y) => x - y);
++}
++
++/**
++ * Where the source video sits in the caption canvas. Every render surface draws the video with
++ * objectFit: contain, so a mismatched aspect letterboxes (never crops). Fractions of the canvas.
++ */
++export function containRect(sourceAspect: number, canvasAspect: number): { x: number; y: number; w: number; h: number } {
++  if (!(sourceAspect > 0) || !(canvasAspect > 0)) return { x: 0, y: 0, w: 1, h: 1 };
++  if (sourceAspect > canvasAspect) {
++    const h = canvasAspect / sourceAspect;
++    return { x: 0, y: (1 - h) / 2, w: 1, h };
++  }
++  const w = sourceAspect / canvasAspect;
++  return { x: (1 - w) / 2, y: 0, w, h: 1 };
++}
++
++// ── Grid integral (summed-area table) ─────────────────────────────────────────────────────────────
++
++export interface GridIntegral { cols: number; rows: number; sat: Float64Array; total: number }
++
++export function integrateGrid(g: CoverageGrid): GridIntegral {
++  const { cols, rows, data } = g;
++  const W = cols + 1;
++  const sat = new Float64Array(W * (rows + 1));
++  for (let r = 0; r < rows; r++) {
++    let rowSum = 0;
++    for (let c = 0; c < cols; c++) {
++      rowSum += data[r * cols + c] || 0;
++      sat[(r + 1) * W + (c + 1)] = sat[r * W + (c + 1)] + rowSum;
++    }
++  }
++  return { cols, rows, sat, total: sat[rows * W + cols] };
++}
++
++/** ∫∫ of the piecewise-constant grid over [0,x]×[0,y] (grid units). Bilinear interpolation of the
++ *  summed-area table is EXACT for piecewise-constant cells, so partial cells count by area. */
++function integralAt(g: GridIntegral, x: number, y: number): number {
++  if (g.cols < 1 || g.rows < 1) return 0;
++  const W = g.cols + 1;
++  const cx = Math.max(0, Math.min(g.cols, x));
++  const cy = Math.max(0, Math.min(g.rows, y));
++  const c = Math.min(Math.floor(cx), g.cols - 1);
++  const r = Math.min(Math.floor(cy), g.rows - 1);
++  const fx = cx - c, fy = cy - r;
++  const s00 = g.sat[r * W + c], s01 = g.sat[r * W + c + 1];
++  const s10 = g.sat[(r + 1) * W + c], s11 = g.sat[(r + 1) * W + c + 1];
++  return s00 + fx * (s01 - s00) + fy * (s10 - s00) + fx * fy * (s11 - s01 - s10 + s00);
++}
++
++/** Face mass inside a rectangle given in grid units. */
++export function gridRectMass(g: GridIntegral, x0: number, y0: number, x1: number, y1: number): number {
++  return integralAt(g, x1, y1) - integralAt(g, x0, y1) - integralAt(g, x1, y0) + integralAt(g, x0, y0);
++}
++
++/**
++ * Share (0–1) of the face a caption block hides at one sampled instant: face mass under the block /
++ * total face mass in the frame. A share, not a density — a small face in a wide shot fully under a
++ * wide caption is 100% hidden even though it covers a sliver of the block.
++ */
++export function hiddenFaceShare(
++  g: GridIntegral, block: CanvasRect, video: { x: number; y: number; w: number; h: number },
++): number {
++  if (!(g.total >= MIN_FACE_MASS)) return 0;
++  const l = Math.max(block.left, video.x), r = Math.min(block.right, video.x + video.w);
++  const t = Math.max(block.top, video.y),  b = Math.min(block.bottom, video.y + video.h);
++  if (r <= l || b <= t) return 0;
++  const x0 = ((l - video.x) / video.w) * g.cols, x1 = ((r - video.x) / video.w) * g.cols;
++  const y0 = ((t - video.y) / video.h) * g.rows, y1 = ((b - video.y) / video.h) * g.rows;
++  return Math.max(0, Math.min(1, gridRectMass(g, x0, y0, x1, y1) / g.total));
++}
++
++// ── Caption block ─────────────────────────────────────────────────────────────────────────────────
++
++/**
++ * Estimated caption block size. Single-line mode shrinks the font to fit the box exactly like the
++ * overlay's fit guard (fitRowScale); two-line mode wraps into as many rows as the text needs (≤ 3).
++ */
++export function estimateCaptionBlock(o: {
++  text: string; fontScale: number; captionLines: 'single' | 'double';
++  widthPercent: number; canvasW: number; canvasH: number;
++}): BlockSize {
++  const words = o.text.split(/\s+/).filter(Boolean);
++  if (!words.length || !(o.canvasW > 0) || !(o.canvasH > 0)) return { width: 0, height: 0 };
++  const fontPx = ROW_FONT_PX * (o.fontScale > 0 ? o.fontScale : 1);
++  const inner = Math.max(1, o.canvasW * (o.widthPercent / 100) * 0.9);   // rows render at maxWidth 90%
++  const items = words.map(text => ({ text, fontPx }));
++  const gaps = (words.length - 1) * WORD_GAP_PX;
++  const textPx = items.reduce((s, it) => s + estTextWidth(it.text, it.fontPx), 0);
++  let rows = 1;
++  let rowPx = fontPx;
++  let rowW: number;
++  if (o.captionLines === 'single') {
++    const k = fitRowScale(items, WORD_GAP_PX, inner);
++    rowPx = fontPx * k;
++    rowW = Math.min(inner, textPx * k + gaps);
++  } else {
++    rows = Math.min(MAX_WRAP_ROWS, Math.max(1, Math.ceil((textPx + gaps) / inner)));
++    rowW = Math.min(inner, textPx + gaps);
++  }
++  const heightPx = rows * rowPx * LINE_HEIGHT + 2 * BLOCK_PAD_Y_PX;
++  const widthPx = rowW + 2 * BLOCK_PAD_X_PX;
++  return { width: Math.min(o.widthPercent / 100, widthPx / o.canvasW), height: heightPx / o.canvasH };
++}
++
++/** The block (plus clearance) centred on the box anchor — CaptionOverlay uses translate(-50%,-50%). */
++export function blockRectAt(size: BlockSize, xPercent: number, yPercent: number): CanvasRect {
++  const cx = xPercent / 100, cy = yPercent / 100;
++  return {
++    left:   cx - size.width / 2 - CLEARANCE_X,
++    right:  cx + size.width / 2 + CLEARANCE_X,
++    top:    cy - size.height / 2 - CLEARANCE_Y,
++    bottom: cy + size.height / 2 + CLEARANCE_Y,
++  };
++}
++
++// ── Placement ─────────────────────────────────────────────────────────────────────────────────────
++
++export interface FaceAwareInput {
++  /** Current per-line overrides (manual boxes are respected, auto boxes are rewritten). */
++  overrides:    Record<string, LineOverride>;
++  /** resolveSegments(captionSegments, words) — the same resolution every render surface uses. */
++  segments:     ResolvedSegment[];
++  captionGapMs: number;
++  durationMs:   number;
++  /** Analysed face grids keyed by sample time (see faceAwareSampleTimes). */
++  grids:        ReadonlyMap<number, CoverageGrid>;
++  /** The user's global caption box — the "default" position. */
++  defaultBox:   CaptionBoxConfig;
++  fontScale:    number;
++  captionLines: 'single' | 'double';
++  /** Logical caption canvas (logicalCanvasSize). */
++  canvasW:      number;
++  canvasH:      number;
++  /** Source video width / height. */
++  sourceAspect: number;
++}
++
++/** A box the user placed themselves (auto placement never overrides it). */
++export function isManualBox(o: LineOverride | undefined): boolean {
++  return !!o?.box && !o.boxAuto;
++}
++
++/**
++ * key → auto Y (percent) for lines that must move, null for lines that stay at the default.
++ * Lines with a manual box, or whose samples are not analysed yet, are ABSENT (leave them as they are).
++ */
++export type FacePlan = Record<string, number | null>;
++
++/**
++ * Why a line ended up where it did:
++ *   moved             — it would have covered the face; this Y clears it.
++ *   moved-partial     — nothing clears it, but this Y hides far less of the face than the default
++ *                       (see fallbackAcceptable).
++ *   clear-at-default  — the user's own position already misses the face.
++ *   no-clear-spot     — it covers the face and no position is clear OR decisively better (subject
++ *                       fills the frame) — the default is kept rather than thrashing to somewhere
++ *                       just as bad.
++ *   manual            — the user placed this caption; auto placement never touches it.
++ *   unknown           — its instants are not analysed yet.
++ */
++export type FacePlacementReason = 'moved' | 'moved-partial' | 'clear-at-default' | 'no-clear-spot' | 'manual' | 'unknown';
++export interface FacePlacement { y: number | null; reason: FacePlacementReason }
++
++export interface FaceAwareCounts { moved: number; partial: number; clear: number; blocked: number; manual: number; pending: number }
++
++export function faceAwareCounts(details: Record<string, FacePlacement>): FaceAwareCounts {
++  const c: FaceAwareCounts = { moved: 0, partial: 0, clear: 0, blocked: 0, manual: 0, pending: 0 };
++  for (const d of Object.values(details)) {
++    if (d.reason === 'moved') c.moved++;
++    else if (d.reason === 'moved-partial') c.partial++;
++    else if (d.reason === 'clear-at-default') c.clear++;
++    else if (d.reason === 'no-clear-spot') c.blocked++;
++    else if (d.reason === 'manual') c.manual++;
++    else c.pending++;
++  }
++  return c;
++}
++
++/** The decisions auto placement acts on — manual and not-yet-analysed lines are left alone. */
++export function detailsToPlan(details: Record<string, FacePlacement>): FacePlan {
++  const plan: FacePlan = {};
++  for (const [key, d] of Object.entries(details)) {
++    if (d.reason === 'manual' || d.reason === 'unknown') continue;
++    plan[key] = d.y;
++  }
++  return plan;
++}
++
++export function planFaceAwarePlacement(input: FaceAwareInput): FacePlan {
++  return detailsToPlan(planFaceAwareDetails(input));
++}
++
++export function planFaceAwareDetails(input: FaceAwareInput): Record<string, FacePlacement> {
++  const { segments, defaultBox, canvasW, canvasH } = input;
++  const details: Record<string, FacePlacement> = {};
++  if (!(canvasW > 0) || !(canvasH > 0)) return details;
++  const video = containRect(input.sourceAspect, canvasW / canvasH);
++  const integrals = new Map<number, GridIntegral>();
++  const integral = (t: number): GridIntegral | undefined => {
++    let g = integrals.get(t);
++    if (!g) {
++      const grid = input.grids.get(t);
++      if (!grid) return undefined;
++      g = integrateGrid(grid);
++      integrals.set(t, g);
++    }
++    return g;
++  };
++
++  const dY = defaultBox.yPercent;
++  let prev: { y: number; endMs: number } | null = null;
++  for (let i = 0; i < segments.length; i++) {
++    const seg = segments[i];
++    const ov = input.overrides[seg.key];
++    if (isManualBox(ov)) {
++      const y = ov!.box!.yPercent;
++      details[seg.key] = { y, reason: 'manual' };
++      prev = { y, endMs: seg.endMs };
++      continue;
++    }
++
++    const { winStart, winEnd } = segmentDisplayWindow(segments, i, input.captionGapMs);
++    const times = lineSampleTimes(seg.startMs, seg.endMs, winStart, winEnd, input.durationMs);
++    const samples = times.map(integral);
++    if (!times.length || samples.some(s => !s)) {
++      const y = ov?.box?.yPercent ?? dY;
++      details[seg.key] = { y, reason: 'unknown' };   // not analysed yet — leave as is
++      prev = { y, endMs: seg.endMs };
++      continue;
++    }
++
++    const size = estimateCaptionBlock({
++      text: seg.sw.map(w => w.text).join(' '),
++      fontScale: ov?.fontScale ?? input.fontScale,
++      captionLines: input.captionLines,
++      widthPercent: defaultBox.widthPercent,
++      canvasW, canvasH,
++    });
++    // Worst instant wins: a caption must stay off the face at every sampled moment it is on screen.
++    const coverageAt = (y: number) => {
++      const rect = blockRectAt(size, defaultBox.xPercent, y);
++      let worst = 0;
++      for (const s of samples) worst = Math.max(worst, hiddenFaceShare(s!, rect, video));
++      return worst;
++    };
++
++    let chosen: number | null = null;
++    let reason: FacePlacementReason = 'clear-at-default';
++    const defaultCov = size.height > 0 ? coverageAt(dY) : 0;
++    // Only move when the default would actually hide the face.
++    if (size.height > 0 && defaultCov > CLEAR_COVERAGE) {
++      reason = 'no-clear-spot';
++      const halfPct = size.height * 50;
++      const lo = Math.ceil(SAFE_TOP_FRAC * 100 + halfPct);
++      const hi = Math.floor((1 - SAFE_BOTTOM_FRAC) * 100 - halfPct);
++      const stableY = prev && seg.startMs - prev.endMs <= STABLE_GAP_MS ? prev.y : null;
++      const costOf = (y: number, cov: number) => cov
++        + DISTANCE_PENALTY * (Math.abs(y - dY) / 100)
++        + (stableY != null ? STABILITY_PENALTY * (Math.abs(y - stableY) / 100) : 0);
++      // ONE position per line (never per frame), chosen by: cost, then the smallest move.
++      const pick = (from: { y: number; cov: number }[]): number | null => {
++        let min = Infinity;
++        for (const c of from) min = Math.min(min, costOf(c.y, c.cov));
++        let best: { y: number; cov: number } | null = null;
++        for (const c of from) {
++          if (costOf(c.y, c.cov) > min + NEAR_EQUAL_COST) continue;
++          if (!best || Math.abs(c.y - dY) < Math.abs(best.y - dY)) best = c;
++        }
++        return best ? best.y : null;
++      };
++
++      const all: { y: number; cov: number }[] = [];
++      let bestCov = Infinity;
++      for (let y = lo; y <= hi; y += Y_STEP_PERCENT) {
++        const cov = coverageAt(y);
++        all.push({ y, cov });
++        if (cov < bestCov) bestCov = cov;
++      }
++      const clearOnes = all.filter(c => c.cov <= CLEAR_COVERAGE);
++      if (clearOnes.length) {
++        const y = pick(clearOnes);
++        if (y != null) { chosen = y; reason = 'moved'; }
++      } else if (all.length && fallbackAcceptable(bestCov, defaultCov)) {
++        // Nothing clears, but one position hides far less of the face than the default — take it.
++        const y = pick(all.filter(c => c.cov <= bestCov + FALLBACK_TOLERANCE));
++        if (y != null) { chosen = y; reason = 'moved-partial'; }
++      }
++      // Otherwise the default is kept: never thrash to a spot that is just as bad.
++    }
++    details[seg.key] = { y: chosen, reason };
++    prev = { y: chosen ?? dY, endMs: seg.endMs };
++  }
++  return details;
++}
++
++function sameBox(a: CaptionBoxConfig, b: CaptionBoxConfig): boolean {
++  return a.xPercent === b.xPercent && a.yPercent === b.yPercent && a.widthPercent === b.widthPercent;
++}
++
++function withoutBox(o: LineOverride): LineOverride {
++  const rest = { ...o };
++  delete rest.box;
++  delete rest.boxAuto;
++  return rest;
++}
++
++/** Write a plan into the override map. Returns the SAME reference when nothing changes. */
++export function applyFacePlan(
++  overrides: Record<string, LineOverride>, plan: FacePlan, defaultBox: CaptionBoxConfig,
++): Record<string, LineOverride> {
++  let next: Record<string, LineOverride> | null = null;
++  for (const [key, y] of Object.entries(plan)) {
++    const ov = overrides[key];
++    if (isManualBox(ov)) continue;
++    if (y == null) {
++      if (!ov || (!ov.box && !ov.boxAuto)) continue;
++      next ??= { ...overrides };
++      const rest = withoutBox(ov);
++      if (Object.keys(rest).length) next[key] = rest; else delete next[key];
++      continue;
++    }
++    const box: CaptionBoxConfig = { xPercent: defaultBox.xPercent, yPercent: y, widthPercent: defaultBox.widthPercent };
++    if (ov?.boxAuto && ov.box && sameBox(ov.box, box)) continue;
++    next ??= { ...overrides };
++    next[key] = { ...ov, box, boxAuto: true };
++  }
++  return next ?? overrides;
++}
++
++/** Plan + apply in one step. Idempotent: re-running on its own result returns the same reference. */
++export function reconcileFaceAwareBoxes(input: FaceAwareInput): Record<string, LineOverride> {
++  return applyFacePlan(input.overrides, planFaceAwarePlacement(input), input.defaultBox);
++}
++
++/**
++ * Apply an already-computed plan (so the editor can report WHY each caption sits where it does
++ * without planning twice). Manual boxes in `overrides` are still honoured — a plan computed a beat
++ * earlier can never overwrite a position the user has just set.
++ */
++export function applyFaceDetails(
++  overrides: Record<string, LineOverride>, details: Record<string, FacePlacement>, defaultBox: CaptionBoxConfig,
++): Record<string, LineOverride> {
++  return applyFacePlan(overrides, detailsToPlan(details), defaultBox);
++}
++
++/** Toggle OFF: drop every automatic box, keep the user's manual ones and every other field. */
++export function removeAutoBoxes(overrides: Record<string, LineOverride>): Record<string, LineOverride> {
++  let next: Record<string, LineOverride> | null = null;
++  for (const [key, o] of Object.entries(overrides)) {
++    if (!o.boxAuto) continue;
++    next ??= { ...overrides };
++    const rest = withoutBox(o);
++    if (Object.keys(rest).length) next[key] = rest; else delete next[key];
++  }
++  return next ?? overrides;
++}
++
++/**
++ * A user edit that sets or clears a line's `box` makes that position MANUAL — unless the patch itself
++ * says otherwise. Applied at the editor's single per-line patch choke point, so every manual path
++ * (drag commit, Position fields, line popover) is covered without each one knowing about auto boxes.
++ */
++export function markBoxPatchManual<P extends Partial<LineOverride>>(patch: P): P {
++  return 'box' in patch && !('boxAuto' in patch) ? { ...patch, boxAuto: undefined } : patch;
++}
++
++export function countManualBoxes(overrides: Record<string, LineOverride>): number {
++  let n = 0;
++  for (const o of Object.values(overrides)) if (isManualBox(o)) n++;
++  return n;
++}
++
++export function countAutoBoxes(overrides: Record<string, LineOverride>): number {
++  let n = 0;
++  for (const o of Object.values(overrides)) if (o.box && o.boxAuto) n++;
++  return n;
++}
++
++/**
++ * The part of the override map the placement READS (manual boxes + per-line font scales), as a
++ * string. Lets the editor re-run placement when those change without re-running on its own writes.
++ */
++export function faceAwareOverrideSig(overrides: Record<string, LineOverride>): string {
++  const parts: string[] = [];
++  for (const [k, o] of Object.entries(overrides)) {
++    const manual = isManualBox(o) ? `${o.box!.xPercent},${o.box!.yPercent},${o.box!.widthPercent}` : '';
++    const fs = typeof o.fontScale === 'number' ? String(o.fontScale) : '';
++    if (manual || fs) parts.push(`${k}:${manual}:${fs}`);
++  }
++  return parts.sort().join('|');
++}
+diff --git a/src/lib/faceAware/faceGrid.spec.ts b/src/lib/faceAware/faceGrid.spec.ts
+new file mode 100644
+index 0000000..9c23ba0
+--- /dev/null
++++ b/src/lib/faceAware/faceGrid.spec.ts
+@@ -0,0 +1,68 @@
++import { describe, it, expect } from 'vitest';
++import { downsampleFaceMask, downsampleSubjectMask, maskRamp, emptyGrid, HAIR_WEIGHT, GRID_COLS, GRID_ROWS } from './faceGrid';
++
++/** width×height mask with `value` inside [x0,x1)×[y0,y1) (pixels), 0 elsewhere. */
++function mask(width: number, height: number, x0: number, y0: number, x1: number, y1: number, value = 1): Float32Array {
++  const m = new Float32Array(width * height);
++  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) m[y * width + x] = value;
++  return m;
++}
++
++describe('maskRamp', () => {
++  it('matches the cut-out threshold: 0 below 0.30, 1 above 0.70, linear between', () => {
++    expect(maskRamp(0.1)).toBe(0);
++    expect(maskRamp(0.3)).toBe(0);
++    expect(maskRamp(0.5)).toBeCloseTo(0.5);
++    expect(maskRamp(0.7)).toBe(1);
++    expect(maskRamp(0.95)).toBe(1);
++  });
++});
++
++describe('downsampleFaceMask', () => {
++  it('averages face probability into the grid cell each pixel falls in', () => {
++    const face = mask(4, 4, 0, 0, 2, 2);           // top-left quadrant
++    const g = downsampleFaceMask({ width: 4, height: 4, face, cols: 2, rows: 2 });
++    expect(Array.from(g.data)).toEqual([1, 0, 0, 0]);
++    expect(g.cols).toBe(2);
++    expect(g.rows).toBe(2);
++  });
++
++  it('counts hair at HAIR_WEIGHT of a face pixel', () => {
++    const face = new Float32Array(4);
++    const hair = mask(2, 2, 0, 0, 2, 2);
++    const g = downsampleFaceMask({ width: 2, height: 2, face, hair, cols: 1, rows: 1 });
++    expect(g.data[0]).toBeCloseTo(HAIR_WEIGHT);
++  });
++
++  it('thresholds face+hair TOGETHER so a boundary pixel split between the classes still counts', () => {
++    const face = new Float32Array([0.4]);
++    const hair = new Float32Array([0.4]);             // each alone would ramp to 0.25; head = 0.8 → 1
++    const g = downsampleFaceMask({ width: 1, height: 1, face, hair, cols: 1, rows: 1 });
++    expect(g.data[0]).toBeCloseTo(1 * ((0.4 + HAIR_WEIGHT * 0.4) / 0.8));
++  });
++
++  it('drops low-confidence noise to zero', () => {
++    const face = new Float32Array(16).fill(0.2);
++    const g = downsampleFaceMask({ width: 4, height: 4, face, cols: 2, rows: 2 });
++    expect(Array.from(g.data)).toEqual([0, 0, 0, 0]);
++  });
++
++  it('defaults to the 54×96 grid', () => {
++    const g = downsampleFaceMask({ width: 8, height: 8, face: new Float32Array(64) });
++    expect(g.cols).toBe(GRID_COLS);
++    expect(g.rows).toBe(GRID_ROWS);
++    expect(g.data.length).toBe(GRID_COLS * GRID_ROWS);
++  });
++});
++
++describe('downsampleSubjectMask / emptyGrid', () => {
++  it('uses the whole person for a single-class model', () => {
++    const subject = mask(4, 4, 2, 2, 4, 4);
++    const g = downsampleSubjectMask({ width: 4, height: 4, subject, cols: 2, rows: 2 });
++    expect(Array.from(g.data)).toEqual([0, 0, 0, 1]);
++  });
++
++  it('emptyGrid is all zero', () => {
++    expect(emptyGrid(3, 2).data.every(v => v === 0)).toBe(true);
++  });
++});
+diff --git a/src/lib/faceAware/faceGrid.ts b/src/lib/faceAware/faceGrid.ts
+new file mode 100644
+index 0000000..7f977e4
+--- /dev/null
++++ b/src/lib/faceAware/faceGrid.ts
+@@ -0,0 +1,87 @@
++// "Keep captions off faces" — turning a segmentation mask into the coarse coverage grid the
++// placement works on. PURE (no DOM / MediaPipe), unit-tested in faceGrid.spec.ts; the browser-side
++// sampler (lib/matte/faceGridSampler.ts) feeds it MediaPipe's confidence masks.
++//
++// Why the FACE, not the whole person: in a typical talking-head frame the body fills the lower half
++// of the picture, exactly where captions live. Avoiding the whole subject would push nearly every
++// caption up over the head. The thing a caption must never sit on is the face, so the grid holds
++// face-skin probability (plus hair at a lower weight, so the top of the head counts a little).
++
++/**
++ * Coarse probability grid in SOURCE-VIDEO space (not caption-canvas space — the placement maps it
++ * through the objectFit:contain rect so one grid serves every aspect ratio).
++ * `data[row * cols + col]` ∈ [0, 1].
++ */
++export interface CoverageGrid { cols: number; rows: number; data: Float32Array }
++
++/** Grid resolution: 54 × 96 — one cell per 20 px of a 1080 × 1920 frame. */
++export const GRID_COLS = 54;
++export const GRID_ROWS = 96;
++
++/** How much a hair pixel counts relative to a face-skin pixel. */
++export const HAIR_WEIGHT = 0.5;
++
++/**
++ * Soft threshold on a model confidence — the SAME 0.30 → 0.70 ramp the behind-subject cut-out uses,
++ * so both features agree on where the person is and low-confidence background noise sums to 0.
++ */
++export function maskRamp(p: number): number {
++  return p <= 0.30 ? 0 : p >= 0.70 ? 1 : (p - 0.30) / 0.40;
++}
++
++function accumulate(
++  width: number, height: number, cols: number, rows: number,
++  value: (i: number) => number,
++): CoverageGrid {
++  const sum = new Float64Array(cols * rows);
++  const count = new Uint32Array(cols * rows);
++  for (let y = 0; y < height; y++) {
++    const r = Math.min(rows - 1, Math.floor((y * rows) / height));
++    for (let x = 0; x < width; x++) {
++      const c = Math.min(cols - 1, Math.floor((x * cols) / width));
++      const cell = r * cols + c;
++      sum[cell] += value(y * width + x);
++      count[cell]++;
++    }
++  }
++  const data = new Float32Array(cols * rows);
++  for (let i = 0; i < data.length; i++) data[i] = count[i] ? sum[i] / count[i] : 0;
++  return { cols, rows, data };
++}
++
++/**
++ * Face grid from a multiclass selfie segmentation (face-skin + hair confidence masks, both
++ * `width × height`, row-major). Head probability is thresholded as a whole, then split by class
++ * weight — thresholding face and hair separately would zero the boundary pixels where the model
++ * shares the probability between the two classes.
++ */
++export function downsampleFaceMask(o: {
++  width: number; height: number;
++  face: Float32Array; hair?: Float32Array | null;
++  cols?: number; rows?: number;
++}): CoverageGrid {
++  const cols = o.cols ?? GRID_COLS, rows = o.rows ?? GRID_ROWS;
++  const { face, hair } = o;
++  return accumulate(o.width, o.height, cols, rows, (i) => {
++    const f = face[i] ?? 0;
++    const h = hair ? (hair[i] ?? 0) : 0;
++    const head = f + h;
++    if (head <= 0) return 0;
++    return Math.min(1, maskRamp(head) * ((f + HAIR_WEIGHT * h) / head));
++  });
++}
++
++/**
++ * Fallback for a single-class model (person vs background): the whole person, thresholded. Only
++ * used if the multiclass face channel is unavailable.
++ */
++export function downsampleSubjectMask(o: {
++  width: number; height: number; subject: Float32Array; cols?: number; rows?: number;
++}): CoverageGrid {
++  const cols = o.cols ?? GRID_COLS, rows = o.rows ?? GRID_ROWS;
++  return accumulate(o.width, o.height, cols, rows, (i) => maskRamp(o.subject[i] ?? 0));
++}
++
++export function emptyGrid(cols = GRID_COLS, rows = GRID_ROWS): CoverageGrid {
++  return { cols, rows, data: new Float32Array(cols * rows) };
++}
+diff --git a/src/lib/matte/faceGridSampler.ts b/src/lib/matte/faceGridSampler.ts
+new file mode 100644
+index 0000000..a59e41e
+--- /dev/null
++++ b/src/lib/matte/faceGridSampler.ts
+@@ -0,0 +1,124 @@
++'use client';
++
++// "Keep captions off faces" — browser-side face analysis for caption placement.
++//
++// Uses the SAME self-hosted MediaPipe runtime + selfie-multiclass model as the "Behind the subject"
++// cut-out, but deliberately does NOT produce a SubjectMatte. The editor treats any SubjectMatte as
++// "draw the person OVER the captions" (VideoCanvas blits every frame it holds) and routes the export
++// to the matte-compositing path whenever one exists — so generating a matte just to measure where the
++// face is would silently turn every caption into a behind-the-subject caption and change how the
++// video exports. Placement only needs a coarse grid at a few instants per caption, so this seeks to
++// exactly those instants and keeps a 54×96 float grid per instant: no WebP encode, no decode cache,
++// nothing that reaches a render surface.
++//
++// Heavy deps are dynamically imported so they never hit SSR or the CEP bundle.
++
++import { canGenerateMatte, WASM_BASE, MODEL_PATH } from './subjectMatte';
++import {
++  downsampleFaceMask, downsampleSubjectMask, emptyGrid, type CoverageGrid,
++} from '@/lib/faceAware/faceGrid';
++
++/** Same capability gate as the cut-out (WASM + OffscreenCanvas + DOM). */
++export const canSampleFaceGrids = canGenerateMatte;
++
++// selfie_multiclass_256x256 confidence-mask order: 0 background, 1 hair, 2 body-skin, 3 face-skin,
++// 4 clothes, 5 others.
++const HAIR = 1;
++const FACE_SKIN = 3;
++
++export interface SampleFaceGridsOptions {
++  videoSrc: string;
++  /** Instants to analyse (ms). */
++  times:    number[];
++  /** Called once per analysed instant, in order. */
++  onGrid:   (tMs: number, grid: CoverageGrid) => void;
++  signal?:  AbortSignal;
++}
++
++function seekTo(video: HTMLVideoElement, tSec: number): Promise<void> {
++  return new Promise<void>((resolve) => {
++    const t = Math.min(tSec, Math.max(0, (video.duration || tSec + 1) - 1e-3));
++    let settled = false;
++    const done = () => {
++      if (settled) return;
++      settled = true;
++      video.removeEventListener('seeked', done);
++      clearTimeout(timer);
++      resolve();
++    };
++    // A seek to the time the element already shows may not fire 'seeked' on every browser —
++    // never let one instant stall the whole analysis.
++    const timer = setTimeout(done, 4000);
++    video.addEventListener('seeked', done);
++    try { video.currentTime = t; } catch { done(); }
++  });
++}
++
++/** Let the editor paint between instants (rAF in the foreground, timeout when the tab is hidden). */
++function yieldToBrowser(): Promise<void> {
++  return new Promise<void>((resolve) => {
++    let done = false;
++    const finish = () => { if (!done) { done = true; resolve(); } };
++    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(finish);
++    setTimeout(finish, 32);
++  });
++}
++
++export async function sampleFaceGrids(opts: SampleFaceGridsOptions): Promise<void> {
++  const { videoSrc, times, onGrid, signal } = opts;
++  if (!canGenerateMatte()) throw new Error('matte-unsupported');
++  const throwIfAborted = () => { if (signal?.aborted) throw new DOMException('aborted', 'AbortError'); };
++
++  const video = document.createElement('video');
++  video.src = videoSrc; video.muted = true; video.preload = 'auto'; video.playsInline = true;
++  let segmenter: import('@mediapipe/tasks-vision').ImageSegmenter | null = null;
++  try {
++    await new Promise<void>((resolve, reject) => {
++      const ok = () => { cleanup(); resolve(); };
++      const no = () => { cleanup(); reject(new Error('face-video-load-failed')); };
++      const cleanup = () => { video.removeEventListener('loadeddata', ok); video.removeEventListener('error', no); };
++      video.addEventListener('loadeddata', ok);
++      video.addEventListener('error', no);
++    });
++    throwIfAborted();
++
++    const vision = await import('@mediapipe/tasks-vision');
++    const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
++    const make = (delegate: 'GPU' | 'CPU') => vision.ImageSegmenter.createFromOptions(fileset, {
++      baseOptions: { modelAssetPath: MODEL_PATH, delegate },
++      // IMAGE mode: instants are sparse and not evenly spaced, so there's no video stream to track.
++      runningMode: 'IMAGE', outputCategoryMask: false, outputConfidenceMasks: true,
++    });
++    try { segmenter = await make('GPU'); } catch { segmenter = await make('CPU'); }
++
++    for (const tMs of times) {
++      throwIfAborted();
++      await seekTo(video, tMs / 1000);
++      throwIfAborted();
++      let result: import('@mediapipe/tasks-vision').ImageSegmenterResult | undefined;
++      try { result = segmenter.segment(video); } catch { result = undefined; }
++      try {
++        const masks = result?.confidenceMasks;
++        let grid: CoverageGrid;
++        if (masks && masks.length > FACE_SKIN) {
++          grid = downsampleFaceMask({
++            width: masks[0].width, height: masks[0].height,
++            face: masks[FACE_SKIN].getAsFloat32Array(), hair: masks[HAIR].getAsFloat32Array(),
++          });
++        } else if (masks && masks.length === 1) {
++          grid = downsampleSubjectMask({ width: masks[0].width, height: masks[0].height, subject: masks[0].getAsFloat32Array() });
++        } else {
++          grid = emptyGrid();
++        }
++        onGrid(tMs, grid);
++      } finally {
++        result?.close?.();
++      }
++      await yieldToBrowser();
++    }
++  } finally {
++    try { segmenter?.close(); } catch { /* noop */ }
++    video.removeAttribute('src');
++    try { video.load(); } catch { /* noop */ }
++  }
++}
+diff --git a/src/lib/matte/subjectMatte.ts b/src/lib/matte/subjectMatte.ts
+index 6c4070c..0fb6ba6 100644
+--- a/src/lib/matte/subjectMatte.ts
++++ b/src/lib/matte/subjectMatte.ts
+@@ -18,8 +18,9 @@
+ import type { TranscriptWord, LineOverride } from '@/types/transcript';
+ import { segmentKeyOf } from '@/lib/captionSegments';
+ 
+-const WASM_BASE  = '/mediapipe/wasm';
+-const MODEL_PATH = '/mediapipe/selfie_multiclass_256x256.tflite';
++// Exported so the face-aware caption sampler (faceGridSampler.ts) loads the SAME self-hosted runtime + model.
++export const WASM_BASE  = '/mediapipe/wasm';
++export const MODEL_PATH = '/mediapipe/selfie_multiclass_256x256.tflite';
+ 
+ export interface MatteWindow { startMs: number; endMs: number }
+ 
+diff --git a/src/lib/projectStore.ts b/src/lib/projectStore.ts
+index c3faaa0..1a6b900 100644
+--- a/src/lib/projectStore.ts
++++ b/src/lib/projectStore.ts
+@@ -68,6 +68,9 @@ export interface ProjectSnapshot {
+   lineOverrides?:       Record<string, LineOverride>;
+   /** Global per-template slot overrides (editor_masala/illusion/aura). */
+   templateSlots?:       TemplateSlotOverrides;
++  /** "Keep captions off faces" toggle. The auto-placed boxes themselves persist inside
++      lineOverrides (flagged boxAuto), so a reload restores both without re-analysing first. */
++  keepCaptionsOffFaces?: boolean;
+ }
+ 
+ /** Lift legacy per-segment style/box overrides into the unified lineOverrides map.
+diff --git a/src/types/transcript.ts b/src/types/transcript.ts
+index cebc9c9..3694197 100644
+--- a/src/types/transcript.ts
++++ b/src/types/transcript.ts
+@@ -243,6 +243,10 @@ export interface LineOverride {
+   boxSize?: { v: number; h: number };   // per-template box padding (ali_abdaal-style pills)
+   text?: Partial<TextOverrides>;        // per-line typography overrides
+   box?: CaptionBoxConfig;               // per-line position/width
++  /** True when `box` was written by "Keep captions off faces" rather than by the user. Rides inside
++      the bundle so every re-keying path and snapshot carries it with the box. A box without this
++      flag is the user's own and auto placement never touches it. */
++  boxAuto?: boolean;
+   /** Per-line caption font scale (the box resize / Size control scoped to this caption).
+       Wins over the global captionFontScale while this caption is on screen. */
+   fontScale?: number;

@@ -1,0 +1,3066 @@
+ src/app/cover-test/CoverHarness.tsx           | 122 ++++++++++++++++++++++++++++++++++++++++++
+ src/app/cover-test/page.tsx                   |  21 ++++++++
+ src/app/editor/page.tsx                       |  73 ++++++++++++++++++++++++-
+ src/components/editor/LeftPanel.tsx           |  67 +++++++++++++----------
+ src/components/editor/MobileCapcutEditor.tsx  |  37 ++++++++++---
+ src/components/editor/VideoCanvas.tsx         |  17 ++++++
+ src/components/editor/cover/CoverPanel.tsx    | 249 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/components/editor/cover/CoverPreview.tsx  |  56 +++++++++++++++++++
+ src/components/editor/cover/CoverStage.tsx    | 217 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/components/editor/cover/useCoverEditor.ts | 310 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib/cover/coverExport.ts                  | 111 ++++++++++++++++++++++++++++++++++++++
+ src/lib/cover/coverLayout.spec.ts             | 224 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib/cover/coverLayout.ts                  | 297 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib/cover/frameCapture.spec.ts            |  22 ++++++++
+ src/lib/cover/frameCapture.ts                 | 129 ++++++++++++++++++++++++++++++++++++++++++++
+ src/lib/cover/headlinePlacement.spec.ts       | 155 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib/cover/headlinePlacement.ts            | 176 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib/cover/subjectGrid.ts                  |  34 ++++++++++++
+ src/lib/matte/subjectMatte.spec.ts            |  41 +++++++++++++-
+ src/lib/matte/subjectMatte.ts                 | 206 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++----------
+ src/lib/projectStore.ts                       |   4 ++
+ src/remotion/CoverComposition.tsx             |  54 +++++++++++++++++++
+ 22 files changed, 2554 insertions(+), 68 deletions(-)
+
+diff --git a/src/app/cover-test/CoverHarness.tsx b/src/app/cover-test/CoverHarness.tsx
+new file mode 100644
+index 0000000..a3097d1
+--- /dev/null
++++ b/src/app/cover-test/CoverHarness.tsx
+@@ -0,0 +1,122 @@
++'use client';
++
++import { useCallback, useRef, useState } from 'react';
++import type { TranscriptWord } from '@/types/transcript';
++import CoverPanel from '@/components/editor/cover/CoverPanel';
++import CoverPreview from '@/components/editor/cover/CoverPreview';
++import CoverStage from '@/components/editor/cover/CoverStage';
++import { useCoverEditor } from '@/components/editor/cover/useCoverEditor';
++import { seekExact, drawVideoFrame } from '@/lib/cover/frameCapture';
++import { CAPTION_STYLES } from '@/lib/captionStyles';
++import { coverPreset, defaultCoverBox, defaultCoverFontScale, isCoverStyleSupported, type CoverSettings } from '@/lib/cover/coverLayout';
++
++const WORDS: TranscriptWord[] = ['Yeh', 'trick', 'koi', 'nahi', 'batata', 'aapko'].map((text, i) => ({
++  id: `w${i}`, text, startMs: i * 400, endMs: i * 400 + 380, styleOverride: {},
++}));
++const SEGMENTS = [['w0', 'w1', 'w2'], ['w3', 'w4', 'w5']];
++const HOOK = {
++  rewrittenScript: 'This one trick changes how you edit forever',
++  overlays: ['Nobody Tells You This', 'Stop Editing Like This', 'Try This Today'],
++};
++
++function Gallery() {
++  const styles = CAPTION_STYLES.filter(d => isCoverStyleSupported(d.id));
++  const preset = coverPreset('reel');
++  const scale = 0.16;
++  return (
++    <div className="p-4 grid gap-3" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${preset.width * scale}px, 1fr))` }}>
++      {styles.map(d => (
++        <div key={d.id} data-gallery-style={d.id} className="flex flex-col gap-1">
++          <div style={{ width: preset.width * scale, height: preset.height * scale, overflow: 'hidden' }}>
++            <div style={{ width: preset.width, height: preset.height, transform: `scale(${scale})`, transformOrigin: 'top left' }}>
++              <CoverStage
++                preset={preset} frameUrl={null} frameW={0} frameH={0} panX={0.5} panY={0.5} zoom={1}
++                text="Nobody Tells You This" styleId={d.id} box={defaultCoverBox('reel')} fontScale={defaultCoverFontScale('reel')}
++                accentColor="#facc15" textColor="#ffffff" watermarked={false}
++              />
++            </div>
++          </div>
++          <span className="text-[10px] text-zinc-400 font-mono">{d.id}</span>
++        </div>
++      ))}
++    </div>
++  );
++}
++
++export default function CoverHarness({ plan, projectClean, gallery, src }: {
++  plan: string; projectClean: boolean; gallery: boolean; src: string;
++}) {
++  const videoRef = useRef<HTMLVideoElement | null>(null);
++  const [durationMs, setDurationMs] = useState(0);
++  const [currentTimeMs, setCurrentTimeMs] = useState(0);
++  const [settings, setSettings] = useState<CoverSettings | null>(null);
++  const [paywall, setPaywall] = useState(false);
++  const [open, setOpen] = useState(false);
++
++  // Callback ref: metadata can load BEFORE hydration attaches onLoadedMetadata, which left the
++  // timeline's max at 1 ms (every scrub clamped to the first frame).
++  const attachVideo = useCallback((v: HTMLVideoElement | null) => {
++    videoRef.current = v;
++    if (!v) return;
++    const read = () => { if (Number.isFinite(v.duration)) setDurationMs(v.duration * 1000); };
++    if (v.readyState >= 1) read();
++    else v.addEventListener('loadedmetadata', read, { once: true });
++  }, []);
++
++  const liveCapture = useCallback(async (t: number) => {
++    const v = videoRef.current;
++    if (!v) throw new Error('no-video');
++    v.pause();
++    await seekExact(v, t);
++    const canvas = drawVideoFrame(v);
++    setCurrentTimeMs(v.currentTime * 1000);
++    return canvas;
++  }, []);
++
++  const editor = useCoverEditor({
++    open, settings, onSettingsChange: setSettings, videoSrc: src, currentTimeMs, isPlaying: false,
++    liveCapture, hook: HOOK, words: WORDS, segments: SEGMENTS, projectStyle: 'mrbeast',
++    accentColor: '#facc15', textColor: '#ffffff', plan, projectClean, entitlementReady: true,
++    fileBase: src.split('/').pop(), onWatermarkedDownload: () => setPaywall(true),
++  });
++
++  if (gallery) return <div className="min-h-screen bg-[#0B0B0D]"><Gallery /></div>;
++
++  return (
++    <div className="flex flex-col h-screen bg-[#0B0B0D] text-white">
++      <div className="flex items-center gap-3 px-4 h-10 border-b border-white/10 text-xs shrink-0">
++        <span className="font-bold">Cover harness (dev only)</span>
++        <span className="text-zinc-400">plan: {plan}{projectClean ? ' + project unlock' : ''}</span>
++        <button data-testid="open-cover" onClick={() => setOpen(o => !o)} className="rounded bg-amber-500/20 px-2 py-1 cursor-pointer">
++          {open ? 'Close Cover' : 'Open Cover'}
++        </button>
++        {paywall && <span data-testid="paywall-opened" className="text-amber-300">Paywall opened (watermark)</span>}
++        <span data-testid="settings-json" className="hidden">{JSON.stringify(settings)}</span>
++        <span data-testid="duration-ms" className="hidden">{Math.round(durationMs)}</span>
++      </div>
++      <div className="flex flex-1 min-h-0">
++        <aside style={{ width: 260 }} className="shrink-0 overflow-y-auto border-r border-white/10 bg-zinc-900/50">
++          {open ? <CoverPanel editor={editor} hookOverlays={HOOK.overlays} currentTimeMs={currentTimeMs} /> : <p className="p-3 text-xs text-zinc-500">Cover closed</p>}
++        </aside>
++        {/* Mirrors the editor: the player stays mounted but hidden while Cover is open. */}
++        <div className={open ? 'hidden' : 'flex-1 flex items-center justify-center min-w-0'}>
++          <video ref={attachVideo} src={src} muted playsInline preload="auto" style={{ maxHeight: '100%', maxWidth: '100%' }} />
++        </div>
++        {open && <CoverPreview editor={editor} />}
++      </div>
++      <div className="h-12 px-4 flex items-center gap-3 border-t border-white/10 shrink-0">
++        <input
++          data-testid="scrub" type="range" min={0} max={Math.max(1, Math.round(durationMs))} step={1}
++          value={Math.round(currentTimeMs)} aria-label="Timeline"
++          onChange={(e) => {
++            const t = Number(e.target.value);
++            setCurrentTimeMs(t);
++            if (videoRef.current) videoRef.current.currentTime = t / 1000;
++          }}
++          className="flex-1"
++        />
++        <span className="font-mono text-xs">{(currentTimeMs / 1000).toFixed(2)}s</span>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/app/cover-test/page.tsx b/src/app/cover-test/page.tsx
+new file mode 100644
+index 0000000..add656a
+--- /dev/null
++++ b/src/app/cover-test/page.tsx
+@@ -0,0 +1,21 @@
++// DEV-ONLY harness for the Cover feature: mounts the real Cover UI (CoverPanel + CoverPreview +
++// useCoverEditor) over a public test video with fixture words, so it can be driven end-to-end without a
++// signed-in session or a paid transcription. 404s in production.
++//
++//   /cover-test?plan=free|pro[&clean=1][&src=/some_public_video.mp4]   → the Cover editor
++//   /cover-test?gallery=1                                               → every supported template as a cover
++
++import { notFound } from 'next/navigation';
++import CoverHarness from './CoverHarness';
++
++export default async function CoverTestPage({
++  searchParams,
++}: {
++  searchParams: Promise<Record<string, string | string[] | undefined>>;
++}) {
++  if (process.env.NODE_ENV === 'production') notFound();
++  const sp = await searchParams;
++  const plan = typeof sp.plan === 'string' ? sp.plan : 'free';
++  const src = typeof sp.src === 'string' && /^\/[\w./-]+\.(mp4|webm|mov)$/i.test(sp.src) ? sp.src : '/test_video.mp4';
++  return <CoverHarness plan={plan} projectClean={sp.clean === '1'} gallery={sp.gallery === '1'} src={src} />;
++}
+diff --git a/src/app/editor/page.tsx b/src/app/editor/page.tsx
+index 1e2f476..ed553d4 100644
+--- a/src/app/editor/page.tsx
++++ b/src/app/editor/page.tsx
+@@ -83,6 +83,10 @@ import PrepareMediaModal, { type PrepareConfig } from '@/components/editor/Prepa
+ import AutoTour from '@/components/tour/EditorTour';
+ import HelpGuide from '@/components/help/HelpGuide';
+ import { capture, identifyUser } from '@/lib/analytics';
++import CoverPanel from '@/components/editor/cover/CoverPanel';
++import CoverPreview from '@/components/editor/cover/CoverPreview';
++import { useCoverEditor } from '@/components/editor/cover/useCoverEditor';
++import { sanitizeCoverSettings, cleanCoverText, defaultCoverSettings, type CoverSettings } from '@/lib/cover/coverLayout';
+ 
+ type NavId   = 'home' | 'search' | 'settings';
+ type Phase   = 'idle' | 'extracting' | 'transcribing' | 'aligning' | 'ready' | 'error';
+@@ -517,6 +521,10 @@ export default function EditorPage() {
+   const [hookData,      setHookData]      = useState<HookResponse | null>(null);
+   const [hookError,     setHookError]     = useState('');
+   const [isLoadingHook, setIsLoadingHook] = useState(false);
++  // Cover (thumbnail): persisted settings + whether the cover stage is showing.
++  const [coverSettings,   setCoverSettings]   = useState<CoverSettings | null>(null);
++  const [coverOpen,       setCoverOpen]       = useState(false);
++  const [coverOpenSignal, setCoverOpenSignal] = useState(0);
+ 
+   // Timeline / playback
+   const [selectedWordId, setSelectedWordId] = useState<string | null>(null);
+@@ -1184,6 +1192,7 @@ export default function EditorPage() {
+       setEmphasisStyle(s.emphasisStyle ?? {});
+       setLayoutMode(s.layoutMode ?? 'splash');
+       setTemplateSlots(s.templateSlots ?? {});
++      setCoverSettings(s.cover ? sanitizeCoverSettings(s.cover) : null);
+       // Salvage overrides orphaned by an older build that re-keyed segments without migrating:
+       // a key that is a non-head word of some saved segment moves back to that segment's head.
+       setLineOverrides(reanchorLineOverrideKeys(s.captionSegments ?? [], migrateSnapshotOverrides(s)));
+@@ -1731,6 +1740,7 @@ export default function EditorPage() {
+     captionGapMs, captionCustomFont, customFontIsCustom,
+     customFontData: customFontData ?? undefined,
+     textOverrides, emphasisStyle, layoutMode, lineOverrides, templateSlots,
++    cover: coverSettings ?? undefined,
+   }), [
+     words, srtNative, transcript, durationMs, captionSegments, captionStyle,
+     dominantColor, accentColor, captionTextColor, captionYPercent,
+@@ -1739,6 +1749,7 @@ export default function EditorPage() {
+     segmentStyleOverrides, bleepRanges, captionGapMs, captionCustomFont,
+     customFontIsCustom, customFontData,
+     textOverrides, emphasisStyle, layoutMode, lineOverrides, templateSlots,
++    coverSettings,
+   ]);
+ 
+   // Ask the browser to persist our storage so the captik IndexedDB (snapshots +
+@@ -1938,6 +1949,8 @@ export default function EditorPage() {
+     setEmphasisStyle({});
+     setTemplateSlots({});
+     setLayoutMode('splash');
++    setCoverSettings(null);
++    setCoverOpen(false);
+     setPendingBox(null);
+     setPendingFontScale(null);
+     setPendingEmphBox(null);
+@@ -4224,6 +4237,40 @@ export default function EditorPage() {
+     return () => window.removeEventListener('keydown', onKey);
+   }, [file, handlePlayPause, handleSeek, handleUndo, handleRedo, currentTimeMs, durationMs, onStyleChange]);
+ 
++  // Hooks — must stay ABOVE the early returns below (auth gate / no file).
++  // ── Cover (thumbnail) editor ─────────────────────────────────────────────────
++  const coverEditor = useCoverEditor({
++    open:             coverOpen && phase === 'ready',
++    settings:         coverSettings,
++    onSettingsChange: setCoverSettings,
++    videoSrc:         videoURL,
++    currentTimeMs,
++    isPlaying,
++    liveCapture:      (t) => (videoCanvas.current ? videoCanvas.current.captureFrame(t) : Promise.reject(new Error('no-player'))),
++    loadStoredBlob:   async () => {
++      const id = currentProjectIdRef.current;
++      const rec = id ? await getStoredProject(id) : null;
++      return rec?.video && rec.video.size > 0 ? rec.video : null;
++    },
++    hook:             hookData,
++    words:            activeWords,
++    segments:         captionSegments,
++    projectStyle:     captionStyle,
++    accentColor,
++    textColor:        captionTextColor,
++    plan:             credits?.plan,
++    projectClean,
++    // A signed-in user's plan must be known before a download, or a paid cover could bake the watermark.
++    entitlementReady: !user || !!credits,
++    fileBase:         file?.name ?? projectName,
++    // Covers NEVER spend a wm credit — a free cover just opens the upgrade.
++    onWatermarkedDownload: () => { setPaywallContext('watermark'); setShowPaywall(true); },
++  });
++  // The cover stage replaces the player while open, so stop playback.
++  useEffect(() => {
++    if (coverOpen && videoCanvas.current?.isPlaying()) videoCanvas.current.toggle();
++  }, [coverOpen]);
++
+   // ── Auth gate ───────────────────────────────────────────────────────────────
+   // Hold a spinner while auth resolves, and while redirecting anonymous visitors
+   // (the effect above sends them to /login). Prevents the editor/dashboard flashing
+@@ -4284,6 +4331,13 @@ export default function EditorPage() {
+   // ── Full NLE view ─────────────────────────────────────────────────────────────
+ 
+   // Panels defined once; `mobile={isMobile}` switches them to full-width on phones.
++  const handleUseAsCover = (text: string) => {
++    setCoverSettings(prev => ({ ...(prev ?? defaultCoverSettings()), text: cleanCoverText(text) }));
++    capture('cover_seeded_from_hook', { source: 'hook_tab' });
++    if (isMobile) setCoverOpenSignal(n => n + 1);
++  };
++  const coverPanelEl = <CoverPanel editor={coverEditor} hookOverlays={hookData?.overlays} currentTimeMs={currentTimeMs} />;
++
+   const leftPanelEl = (
+     <LeftPanel
+       mobile={isMobile}
+@@ -4324,6 +4378,9 @@ export default function EditorPage() {
+       lineOverrides={lineOverrides}
+       onLineOverride={handleLineOverride}
+       captionBox={captionBox}
++      coverPanel={coverPanelEl}
++      onTabChange={(t) => setCoverOpen(t === 'cover')}
++      onUseAsCover={handleUseAsCover}
+     />
+   );
+ 
+@@ -4409,6 +4466,15 @@ export default function EditorPage() {
+     />
+   );
+ 
++  // While Cover is open the stage takes the player's place. The player stays MOUNTED (hidden) so the
++  // timeline keeps scrubbing it and the exact frame capture keeps working.
++  const centerEl = (
++    <>
++      <div className={coverOpen ? 'hidden' : 'contents'}>{videoCanvasEl}</div>
++      {coverOpen && <CoverPreview editor={coverEditor} />}
++    </>
++  );
++
+   const rightPanelEl = (
+     <RightPanel
+       mobile={isMobile}
+@@ -4667,7 +4733,7 @@ export default function EditorPage() {
+       <>
+         <MobileCapcutEditor
+           topBarEl={topBarEl}
+-          videoCanvasEl={videoCanvasEl}
++          videoCanvasEl={centerEl}
+           rightPanelEl={rightPanelEl}
+           leftPanelEl={leftPanelEl}
+           isPlaying={isPlaying}
+@@ -4697,6 +4763,9 @@ export default function EditorPage() {
+           onCaptionBoxChange={handleCaptionBoxChange}
+           onCaptionBoxScope={handleCaptionBoxScope}
+           onCaptionBoxCancel={handleCaptionBoxCancel}
++          coverPanelEl={coverPanelEl}
++          onCoverOpenChange={setCoverOpen}
++          coverOpenSignal={coverOpenSignal}
+         />
+         {paywallEl}
+         {watermarkCheckEl}
+@@ -4716,7 +4785,7 @@ export default function EditorPage() {
+         {topBarEl}
+         <div className="flex flex-1 overflow-hidden min-h-0">
+           {leftPanelEl}
+-          {videoCanvasEl}
++          {centerEl}
+           {rightPanelEl}
+         </div>
+         {timelineEl}
+diff --git a/src/components/editor/LeftPanel.tsx b/src/components/editor/LeftPanel.tsx
+index 578cf57..d24dcd0 100644
+--- a/src/components/editor/LeftPanel.tsx
++++ b/src/components/editor/LeftPanel.tsx
+@@ -2,7 +2,7 @@
+ 
+ import { useState, useRef, useMemo, useEffect } from 'react';
+ import { motion, AnimatePresence } from 'framer-motion';
+-import { Type, Sparkles, Clapperboard, Loader2, ChevronRight, Wand2, Copy, Check, RefreshCw, SlidersHorizontal, ChevronDown, Scissors, Plus, Pencil, Trash2, ChevronUp, Undo2, Redo2, Blend, LayoutPanelTop } from 'lucide-react';
++import { Type, Sparkles, Loader2, ChevronRight, Wand2, Copy, Check, RefreshCw, SlidersHorizontal, ChevronDown, Scissors, Plus, Pencil, Trash2, ChevronUp, Undo2, Redo2, Blend, LayoutPanelTop, ImageIcon } from 'lucide-react';
+ import type { TranscriptWord, LineOverride, CaptionBoxConfig } from '@/types/transcript';
+ import type { HookResponse } from '@/app/api/hook/route';
+ import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
+@@ -10,19 +10,20 @@ import Tooltip from '@/components/ui/Tooltip';
+ import { CAPTION_STYLES as TEMPLATE_DEFS } from '@/lib/captionStyles';
+ import LineStylingPopover from './LineStylingPopover';
+ 
+-type Tab = 'captions' | 'hook' | 'broll';
++export type LeftPanelTab = 'captions' | 'hook' | 'cover';
++type Tab = LeftPanelTab;
+ 
+ const TABS: { id: Tab; icon: React.FC<React.SVGProps<SVGSVGElement>>; label: string }[] = [
+   { id: 'captions',  icon: Type,          label: 'Captions'  },
+   { id: 'hook',      icon: Sparkles,      label: 'AI Hook'   },
+-  { id: 'broll',     icon: Clapperboard,  label: 'B-Roll'    },
++  { id: 'cover',     icon: ImageIcon,     label: 'Cover'     },
+ ];
+ 
+ // One-line tooltips for the icon rail.
+ const TAB_HINTS: Record<Tab, string> = {
+   captions: 'Edit caption lines, words & colours',
+   hook:     'Generate hook ideas with AI',
+-  broll:    'B-Roll suggestions — coming soon',
++  cover:    'Make a thumbnail cover from a frame',
+ };
+ 
+ interface StyleDef {
+@@ -387,6 +388,13 @@ interface LeftPanelProps {
+   lineOverrides?:          Record<string, LineOverride>;
+   onLineOverride?:         (keys: string | string[], patch: Partial<LineOverride> | null) => void;
+   captionBox?:             CaptionBoxConfig;
++  /** Cover tab content (the page owns the cover editor). Omitted, or on phones (Cover has its own
++      bottom tab there), the rail shows no Cover tab. */
++  coverPanel?:             React.ReactNode;
++  /** Fired whenever the active tab changes — the page opens the cover stage while 'cover' is active. */
++  onTabChange?:            (tab: LeftPanelTab) => void;
++  /** "Use as cover" on an AI hook line. */
++  onUseAsCover?:           (text: string) => void;
+ }
+ 
+ export default function LeftPanel({
+@@ -403,14 +411,26 @@ export default function LeftPanel({
+   mobile = false,
+   lineOverrides = {}, onLineOverride,
+   captionBox = { xPercent: 50, yPercent: 85, widthPercent: 84 },
++  coverPanel, onTabChange, onUseAsCover,
+ }: LeftPanelProps) {
+-  const [tab, setTab] = useState<Tab>('captions');
++  const [tab, setTabState] = useState<Tab>('captions');
++  const onTabChangeRef = useRef(onTabChange);
++  const tabRef = useRef<Tab>(tab);
++  useEffect(() => { onTabChangeRef.current = onTabChange; tabRef.current = tab; });
++  const setTab = (t: Tab) => { setTabState(t); onTabChangeRef.current?.(t); };
++  // Unmounting while Cover is active must close the cover stage too.
++  useEffect(() => () => { if (tabRef.current === 'cover') onTabChangeRef.current?.('captions'); }, []);
++  const showCover = !!coverPanel && !mobile;
++  const railTabs = TABS.filter(t => t.id !== 'cover' || showCover);
++  const useAsCover = onUseAsCover
++    ? (text: string) => { if (showCover) setTab('cover'); onUseAsCover(text); }
++    : undefined;
+ 
+   return (
+     <aside data-tour="captions-panel" className={`flex h-full ${mobile ? 'w-full' : 'shrink-0'}`} style={mobile ? undefined : { width: 260 }}>
+       {/* Icon rail */}
+       <div className="flex flex-col items-center gap-1 py-3 px-2 bg-zinc-950 border-r border-white/[0.04]" style={{ width: 52 }}>
+-        {TABS.map(({ id, icon: Icon, label }) => (
++        {railTabs.map(({ id, icon: Icon, label }) => (
+           <Tooltip key={id} label={TAB_HINTS[id] ?? label} side="bottom">
+             <button
+               onClick={() => setTab(id)}
+@@ -488,9 +508,10 @@ export default function LeftPanel({
+                 hookError={hookError}
+                 isLoading={isLoadingHook}
+                 onGenerate={onGenerateHook}
++                onUseAsCover={useAsCover}
+               />
+             )}
+-            {tab === 'broll' && <BRollTab />}
++            {tab === 'cover' && showCover && coverPanel}
+           </motion.div>
+         </AnimatePresence>
+       </div>
+@@ -1377,13 +1398,14 @@ function CopyButton({ text }: { text: string }) {
+ }
+ 
+ function HookTab({
+-  transcript, hookData, hookError, isLoading, onGenerate,
++  transcript, hookData, hookError, isLoading, onGenerate, onUseAsCover,
+ }: {
+   transcript: string;
+   hookData:   HookResponse | null;
+   hookError:  string;
+   isLoading:  boolean;
+   onGenerate: () => void;
++  onUseAsCover?: (text: string) => void;
+ }) {
+   const has3s = transcript.trim().split(/\s+/).length >= 5;
+ 
+@@ -1445,6 +1467,15 @@ function HookTab({
+                 <div key={i} className="flex items-center gap-2 text-[11px]">
+                   <span className="text-amber-400 font-mono shrink-0">{i + 1}.</span>
+                   <span className="text-zinc-300">{o}</span>
++                  {onUseAsCover && (
++                    <button
++                      onClick={() => onUseAsCover(o)}
++                      className="ml-auto shrink-0 flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-amber-300 hover:bg-amber-500/10 cursor-pointer"
++                      title="Use this line as your cover headline"
++                    >
++                      <ImageIcon className="w-3 h-3" /> Use as cover
++                    </button>
++                  )}
+                 </div>
+               ))}
+             </div>
+@@ -1470,24 +1501,4 @@ function HookTab({
+   );
+ }
+ 
+-// ── B-Roll tab ────────────────────────────────────────────────────────────────
+-
+-function BRollTab() {
+-  return (
+-    <div className="p-3 flex flex-col items-center gap-3 text-center">
+-      <div className="w-12 h-12 rounded-2xl bg-white/[0.04] border border-white/[0.07] flex items-center justify-center mt-4">
+-        <Clapperboard className="w-5 h-5 text-zinc-600" />
+-      </div>
+-      <div>
+-        <p className="text-xs font-semibold text-zinc-400">B-Roll AI</p>
+-        <p className="text-[11px] text-zinc-600 mt-1 leading-relaxed">
+-          Auto-suggest stock footage based on your transcript. Coming soon.
+-        </p>
+-      </div>
+-      <div className="w-full px-2 py-2 rounded-xl bg-white/[0.03] border border-white/[0.06]">
+-        <p className="text-[10px] text-zinc-700">Join waitlist to get early access</p>
+-      </div>
+-    </div>
+-  );
+-}
+ 
+diff --git a/src/components/editor/MobileCapcutEditor.tsx b/src/components/editor/MobileCapcutEditor.tsx
+index 00ab9d8..c71905a 100644
+--- a/src/components/editor/MobileCapcutEditor.tsx
++++ b/src/components/editor/MobileCapcutEditor.tsx
+@@ -4,7 +4,7 @@ import { useRef, useEffect, useState, useMemo, useCallback, type ReactNode } fro
+ import {
+   Play, Pause, SkipBack, SkipForward, Undo2, Redo2,
+   AlignLeft, Palette, Scissors, X, Move, Trash2, Check,
+-  ChevronUp, ChevronDown, ChevronLeft, ChevronRight,
++  ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ImageIcon,
+ } from 'lucide-react';
+ import { motion, AnimatePresence } from 'framer-motion';
+ import type { TranscriptWord, CaptionBoxConfig } from '@/types/transcript';
+@@ -15,7 +15,7 @@ import SegmentStylePicker from './SegmentStylePicker';
+ 
+ // ─── types ────────────────────────────────────────────────────────────────────
+ 
+-type MobileTab = 'timeline' | 'captions' | 'style';
++type MobileTab = 'timeline' | 'captions' | 'style' | 'cover';
+ 
+ export interface MobileCapcutEditorProps {
+   topBarEl:       ReactNode;
+@@ -58,6 +58,14 @@ export interface MobileCapcutEditorProps {
+   onCaptionBoxChange:   (box: CaptionBoxConfig) => void;
+   onCaptionBoxScope:    (scope: 'all' | 'block') => void;
+   onCaptionBoxCancel:   () => void;
++
++  // ── Cover (optional) ──
++  /** Cover sheet content. Omitted → no Cover tab. */
++  coverPanelEl?:        ReactNode;
++  /** True while the Cover sheet is open (the page swaps the preview for the cover stage). */
++  onCoverOpenChange?:   (open: boolean) => void;
++  /** Increment to open the Cover sheet from outside (e.g. "Use as cover" in the AI Hook tab). */
++  coverOpenSignal?:     number;
+ }
+ 
+ // ─── helpers ──────────────────────────────────────────────────────────────────
+@@ -93,9 +101,19 @@ export default function MobileCapcutEditor({
+   positionMode, onPositionModeChange,
+   captionBox, segmentBoxOverrides, pendingBox,
+   onCaptionBoxChange, onCaptionBoxScope, onCaptionBoxCancel,
++  coverPanelEl, onCoverOpenChange, coverOpenSignal = 0,
+ }: MobileCapcutEditorProps) {
+   const [activeTab, setActiveTab] = useState<MobileTab>('timeline');
+-  const [sheetOpen, setSheetOpen] = useState<'captions' | 'style' | null>(null);
++  const [sheetOpen, setSheetOpen] = useState<'captions' | 'style' | 'cover' | null>(null);
++  // "Use as cover" from outside: open the Cover sheet (adjust-state-during-render, no effect).
++  const [seenCoverSignal, setSeenCoverSignal] = useState(coverOpenSignal);
++  if (coverOpenSignal !== seenCoverSignal) {
++    setSeenCoverSignal(coverOpenSignal);
++    if (coverPanelEl) { setSheetOpen('cover'); setActiveTab('cover'); }
++  }
++  const onCoverOpenChangeRef = useRef(onCoverOpenChange);
++  useEffect(() => { onCoverOpenChangeRef.current = onCoverOpenChange; });
++  useEffect(() => { onCoverOpenChangeRef.current?.(sheetOpen === 'cover'); }, [sheetOpen]);
+   const [stylePicker, setStylePicker] = useState<{ segKeys: string[] } | null>(null);
+   // Long-press a caption clip → selection mode; taps then toggle membership and
+   // "Style" bulk-applies a template to every selected caption (CapCut pattern).
+@@ -427,7 +445,7 @@ export default function MobileCapcutEditor({
+ 
+   // ── tab / sheet handlers ───────────────────────────────────────────────────
+   const handleTabClick = (id: MobileTab) => {
+-    if (id === 'captions' || id === 'style') {
++    if (id === 'captions' || id === 'style' || id === 'cover') {
+       if (sheetOpen === id) {
+         setSheetOpen(null);
+         setActiveTab('timeline');
+@@ -447,10 +465,13 @@ export default function MobileCapcutEditor({
+     { id: 'timeline', label: 'Edit',     hint: 'Timeline — scrub the video and select captions', Icon: Scissors  },
+     { id: 'captions', label: 'Captions', hint: 'Edit caption text, split/merge & emphasis',       Icon: AlignLeft },
+     { id: 'style',    label: 'Style',    hint: 'Fonts, colours, templates & position',            Icon: Palette   },
++    ...(coverPanelEl ? [{ id: 'cover' as const, label: 'Cover', hint: 'Make a thumbnail cover from a frame', Icon: ImageIcon }] : []),
+   ];
+ 
+   // video height shrinks when sheet is open so the preview stays visible
+-  const videoH = sheetOpen
++  const videoH = sheetOpen === 'cover'
++    ? 'clamp(160px, 34dvh, 320px)'   // the cover preview IS the point of this sheet
++    : sheetOpen
+     ? 'clamp(120px, 22dvh, 200px)'
+     : 'clamp(200px, 42dvh, 420px)';
+ 
+@@ -541,7 +562,7 @@ export default function MobileCapcutEditor({
+ 
+       {/* ── Overview scrubber + time ─────────────────────────────────────────── */}
+       {/* Hidden while a sheet is open so the Captions/Style panel gets the full height. */}
+-      <div data-tour="m-scrub" className={`shrink-0 items-center gap-3 px-4 h-9 bg-[#0A0A0E] border-t border-white/[0.04] ${sheetOpen ? 'hidden' : 'flex'}`}>
++      <div data-tour="m-scrub" className={`shrink-0 items-center gap-3 px-4 h-9 bg-[#0A0A0E] border-t border-white/[0.04] ${sheetOpen && sheetOpen !== 'cover' ? 'hidden' : 'flex'}`}>
+         <span className="font-mono text-[10px] text-zinc-600 tabular-nums shrink-0">
+           {fmtMs(currentTimeMs)}
+         </span>
+@@ -911,7 +932,7 @@ export default function MobileCapcutEditor({
+                   duplicate Captions/Style tabs here (frees vertical room for the panel). */}
+               <div className="shrink-0 flex items-center border-b border-white/[0.06] px-3 h-10">
+                 <span className="text-[13px] font-bold text-white capitalize">
+-                  {sheetOpen === 'captions' ? 'Captions' : 'Style'}
++                  {sheetOpen === 'captions' ? 'Captions' : sheetOpen === 'cover' ? 'Cover' : 'Style'}
+                 </span>
+                 <div className="flex-1" />
+                 <button
+@@ -927,7 +948,7 @@ export default function MobileCapcutEditor({
+ 
+               {/* Sheet content */}
+               <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+-                {sheetOpen === 'captions' ? leftPanelEl : rightPanelEl}
++                {sheetOpen === 'captions' ? leftPanelEl : sheetOpen === 'cover' ? coverPanelEl : rightPanelEl}
+               </div>
+             </motion.div>
+           )}
+diff --git a/src/components/editor/VideoCanvas.tsx b/src/components/editor/VideoCanvas.tsx
+index 9563f34..296bd85 100644
+--- a/src/components/editor/VideoCanvas.tsx
++++ b/src/components/editor/VideoCanvas.tsx
+@@ -19,6 +19,7 @@ import Tooltip from '@/components/ui/Tooltip';
+ import { customFontStack } from '@/lib/textParser';
+ import { HEVC_UNSUPPORTED_MSG } from '@/lib/mediaInfo';
+ import type { SubjectMatte } from '@/lib/matte/subjectMatte';
++import { seekExact, drawVideoFrame } from '@/lib/cover/frameCapture';
+ 
+ type Phase = 'idle' | 'extracting' | 'transcribing' | 'aligning' | 'ready' | 'error';
+ 
+@@ -26,6 +27,8 @@ export interface VideoCanvasHandle {
+   toggle():        void;
+   seekTo(ms: number): void;
+   isPlaying():     boolean;
++  /** Pause, seek EXACTLY to `ms` (never fastSeek) and draw that frame at source resolution. */
++  captureFrame(ms: number): Promise<HTMLCanvasElement>;
+ }
+ 
+ interface VideoCanvasProps {
+@@ -329,6 +332,20 @@ const VideoCanvas = forwardRef<VideoCanvasHandle, VideoCanvasProps>(function Vid
+     isPlaying() {
+       return videoRef.current ? !videoRef.current.paused : false;
+     },
++    async captureFrame(ms: number) {
++      const v = videoRef.current;
++      if (!v) throw new Error('no-video');
++      // A cover must be the EXACT frame picked — not the keyframe fastSeek lands on while scrubbing.
++      shouldPlayRef.current = false;
++      if (!v.paused) v.pause();
++      await seekExact(v, ms);
++      const canvas = drawVideoFrame(v);
++      const at = v.currentTime * 1000;
++      drawCutoutRef.current();
++      setLocalMs(at);
++      onTimeUpdateRef.current?.(at);
++      return canvas;
++    },
+   }), []);
+ 
+   // ── RAF-based time tracking ────────────────────────────────────────────
+diff --git a/src/components/editor/cover/CoverPanel.tsx b/src/components/editor/cover/CoverPanel.tsx
+new file mode 100644
+index 0000000..7d50f3f
+--- /dev/null
++++ b/src/components/editor/cover/CoverPanel.tsx
+@@ -0,0 +1,249 @@
++'use client';
++
++// Cover controls — the left-panel tab (desktop) and the Cover sheet (mobile).
++
++import { useMemo } from 'react';
++import { Download, Loader2, Crosshair, Lock, UserRound, Sparkles } from 'lucide-react';
++import { CAPTION_STYLES } from '@/lib/captionStyles';
++import { COVER_PRESETS, COVER_MAX_CHARS, COVER_FONT_SCALE_MIN, COVER_FONT_SCALE_MAX, COVER_ZOOM_MAX, isCoverStyleSupported } from '@/lib/cover/coverLayout';
++import type { CoverEditor } from './useCoverEditor';
++
++function fmtTime(ms: number): string {
++  const s = Math.max(0, ms) / 1000;
++  const m = Math.floor(s / 60);
++  return `${m}:${(s - m * 60).toFixed(1).padStart(4, '0')}`;
++}
++
++function Section({ title, children, right }: { title: string; children: React.ReactNode; right?: React.ReactNode }) {
++  return (
++    <div className="flex flex-col gap-2">
++      <div className="flex items-center justify-between">
++        <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">{title}</p>
++        {right}
++      </div>
++      {children}
++    </div>
++  );
++}
++
++function Slider({ label, value, min, max, step, onChange, format }: {
++  label: string; value: number; min: number; max: number; step: number;
++  onChange: (v: number) => void; format?: (v: number) => string;
++}) {
++  return (
++    <label className="flex flex-col gap-1">
++      <span className="flex justify-between text-[11px] text-zinc-400">
++        <span>{label}</span>
++        <span className="font-mono text-zinc-500">{format ? format(value) : value.toFixed(2)}</span>
++      </span>
++      <input
++        type="range" min={min} max={max} step={step} value={value}
++        onChange={(e) => onChange(Number(e.target.value))}
++        className="w-full accent-amber-400 cursor-pointer"
++        aria-label={label}
++      />
++    </label>
++  );
++}
++
++export default function CoverPanel({ editor, hookOverlays, currentTimeMs }: {
++  editor: CoverEditor;
++  hookOverlays?: string[];
++  currentTimeMs: number;
++}) {
++  const { settings: s, update, stageProps } = editor;
++  const styles = useMemo(() => CAPTION_STYLES.filter(d => isCoverStyleSupported(d.id)), []);
++  const pct = (v: number) => `${Math.round(v)}%`;
++
++  return (
++    <div className="p-3 flex flex-col gap-5" data-cover-panel="">
++      <Section title="Size">
++        <div className="grid grid-cols-3 gap-1.5">
++          {COVER_PRESETS.map(p => (
++            <button
++              key={p.id}
++              onClick={() => editor.setPreset(p.id)}
++              aria-pressed={s.preset === p.id}
++              className={`rounded-lg px-1.5 py-2 text-center border transition-colors cursor-pointer ${
++                s.preset === p.id ? 'bg-amber-500/15 border-amber-400/40 text-amber-200' : 'bg-white/[0.03] border-white/[0.07] text-zinc-400 hover:text-zinc-200'
++              }`}
++            >
++              <span className="block text-[11px] font-semibold leading-tight">{p.label}</span>
++              <span className="block text-[9px] text-zinc-500 mt-0.5">{p.hint}</span>
++            </button>
++          ))}
++        </div>
++      </Section>
++
++      <Section
++        title="Frame"
++        right={editor.frame && <span className="text-[10px] font-mono text-zinc-500">{fmtTime(editor.frame.tMs)}</span>}
++      >
++        <button
++          onClick={editor.useCurrentFrame}
++          disabled={editor.frameStatus === 'capturing'}
++          className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold bg-white/[0.06] border border-white/[0.1] text-white hover:bg-white/[0.1] disabled:opacity-50 cursor-pointer"
++        >
++          {editor.frameStatus === 'capturing' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Crosshair className="w-3.5 h-3.5" />}
++          Use current frame ({fmtTime(currentTimeMs)})
++        </button>
++        {editor.locked ? (
++          <p className="text-[11px] text-zinc-500 leading-snug flex items-center gap-1.5">
++            <Lock className="w-3 h-3 shrink-0" /> Frame locked.
++            <button onClick={editor.followPlayhead} className="text-amber-300 hover:underline cursor-pointer">Follow the timeline instead</button>
++          </p>
++        ) : (
++          <p className="text-[11px] text-zinc-500 leading-snug">Scrub the timeline — the cover follows it. Tap the button to lock a frame.</p>
++        )}
++        {editor.frameError && <p className="text-[11px] text-red-300">{editor.frameError}</p>}
++      </Section>
++
++      <Section title="Headline" right={<span className="text-[10px] text-zinc-600">{s.text.length}/{COVER_MAX_CHARS}</span>}>
++        <textarea
++          value={s.text}
++          onChange={(e) => editor.setText(e.target.value)}
++          maxLength={COVER_MAX_CHARS}
++          rows={2}
++          placeholder="Your headline"
++          aria-label="Cover headline"
++          className="w-full resize-none rounded-lg bg-black/30 border border-white/[0.08] px-2.5 py-2 text-sm text-white placeholder:text-zinc-600 focus:outline-none focus:border-amber-400/50"
++        />
++        {!!hookOverlays?.length && (
++          <div className="flex flex-wrap gap-1.5">
++            {hookOverlays.filter(Boolean).map((o, i) => (
++              <button
++                key={i}
++                onClick={() => editor.setText(o, true)}
++                className="flex items-center gap-1 rounded-full bg-amber-500/10 border border-amber-400/20 px-2 py-0.5 text-[10px] text-amber-200 hover:bg-amber-500/20 cursor-pointer"
++                title="Use this AI hook line"
++              >
++                <Sparkles className="w-2.5 h-2.5" /> {o}
++              </button>
++            ))}
++          </div>
++        )}
++      </Section>
++
++      <Section title="Template">
++        <div className="grid grid-cols-2 gap-1.5">
++          {styles.map(d => {
++            const active = stageProps.styleId === d.id;
++            return (
++              <button
++                key={d.id}
++                onClick={() => update({ styleId: d.id })}
++                aria-pressed={active}
++                title={d.name}
++                className={`relative h-[62px] rounded-lg overflow-hidden border bg-zinc-950 cursor-pointer transition-colors ${
++                  active ? 'border-amber-400/70 ring-1 ring-amber-400/40' : 'border-white/[0.07] hover:border-white/20'
++                }`}
++              >
++                <div className="absolute inset-0 flex items-center justify-center pointer-events-none" style={{ transform: 'scale(0.55)' }}>
++                  {d.renderPreview ? d.renderPreview() : <span style={d.textStyle}>{d.previewText}</span>}
++                </div>
++                <span className="absolute bottom-0 inset-x-0 bg-black/70 text-[9px] text-zinc-300 py-0.5 truncate px-1">{d.name}</span>
++              </button>
++            );
++          })}
++        </div>
++        <p className="text-[10px] text-zinc-600 leading-snug">
++          Templates with glass, gradient or blend effects (Hormozi, Aura, Illusion, Big Reveal and a few more), and one-word-at-a-time templates, can&apos;t be used for covers yet.
++        </p>
++      </Section>
++
++      <Section title="Text size & position">
++        <Slider label="Size" value={s.fontScale} min={COVER_FONT_SCALE_MIN} max={COVER_FONT_SCALE_MAX} step={0.05}
++          onChange={(v) => update({ fontScale: v })} format={(v) => `${v.toFixed(2)}×`} />
++        {/* Moving the headline by hand is a placement decision: it stops the automatic subject avoidance. */}
++        <Slider label="Vertical" value={s.box.yPercent} min={5} max={95} step={1}
++          onChange={(v) => update({ box: { ...s.box, yPercent: v }, boxAuto: false })} format={pct} />
++        <Slider label="Horizontal" value={s.box.xPercent} min={10} max={90} step={1}
++          onChange={(v) => update({ box: { ...s.box, xPercent: v }, boxAuto: false })} format={pct} />
++        <Slider label="Width" value={s.box.widthPercent} min={30} max={100} step={1}
++          onChange={(v) => update({ box: { ...s.box, widthPercent: v }, boxAuto: false })} format={pct} />
++        {editor.subjectShown && (s.boxAuto ? (
++          <div className="flex flex-col gap-1" data-cover-clear="auto">
++            <p className="text-[11px] text-zinc-500 leading-snug flex items-start gap-1.5">
++              <UserRound className="w-3 h-3 mt-0.5 shrink-0" />
++              Placed clear of the subject. Move it yourself and it stays where you put it.
++            </p>
++            {editor.headlineCoverage != null && editor.headlineCoverage > 0.15 && (
++              <p className="text-[11px] text-amber-300/90 leading-snug">
++                The subject fills most of the frame, so it still hides part of the headline. Try a smaller size or another frame.
++              </p>
++            )}
++          </div>
++        ) : (
++          <button
++            onClick={editor.clearOfSubject}
++            data-cover-clear="manual"
++            className="self-start flex items-center gap-1.5 rounded-lg bg-white/[0.05] border border-white/[0.09] px-2.5 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-white/[0.09] cursor-pointer"
++          >
++            <UserRound className="w-3 h-3" /> Move headline clear of the subject
++          </button>
++        ))}
++      </Section>
++
++      <Section title="Crop">
++        <Slider label="Zoom" value={s.zoom} min={1} max={COVER_ZOOM_MAX} step={0.05}
++          onChange={(v) => update({ zoom: v })} format={(v) => `${v.toFixed(2)}×`} />
++        <Slider label="Left ↔ right" value={s.panX} min={0} max={1} step={0.01}
++          onChange={(v) => update({ panX: v })} format={(v) => pct(v * 100)} />
++        <Slider label="Top ↕ bottom" value={s.panY} min={0} max={1} step={0.01}
++          onChange={(v) => update({ panY: v })} format={(v) => pct(v * 100)} />
++      </Section>
++
++      <Section title="Subject">
++        <label className="flex items-center justify-between gap-2 rounded-xl bg-white/[0.03] border border-white/[0.07] px-3 py-2.5 cursor-pointer">
++          <span className="flex items-center gap-2 text-xs text-zinc-200">
++            <UserRound className="w-3.5 h-3.5 text-zinc-400" />
++            Subject in front of text
++          </span>
++          <span className="flex items-center gap-1.5">
++            {editor.cutoutStatus === 'working' && <Loader2 className="w-3 h-3 animate-spin text-zinc-400" />}
++            <input
++              type="checkbox"
++              checked={s.subjectInFront}
++              disabled={!editor.frame || editor.cutoutStatus === 'working'}
++              onChange={(e) => editor.setSubjectInFront(e.target.checked)}
++              className="w-4 h-4 accent-amber-400 cursor-pointer"
++              aria-label="Subject in front of text"
++            />
++          </span>
++        </label>
++        {editor.cutoutError
++          ? <p role="alert" className="text-[11px] text-red-300 leading-snug">{editor.cutoutError}</p>
++          : <p className="text-[10px] text-zinc-600 leading-snug">Cuts the person out of this frame on your device and places them over the headline. The first use downloads a ~16 MB model.</p>}
++      </Section>
++
++      <Section title="Download">
++        <div className="grid grid-cols-2 gap-1.5">
++          {(['png', 'jpeg'] as const).map(f => (
++            <button
++              key={f}
++              onClick={() => update({ format: f })}
++              aria-pressed={s.format === f}
++              className={`rounded-lg py-1.5 text-[11px] font-semibold border cursor-pointer ${
++                s.format === f ? 'bg-amber-500/15 border-amber-400/40 text-amber-200' : 'bg-white/[0.03] border-white/[0.07] text-zinc-400'
++              }`}
++            >
++              {f === 'png' ? 'PNG' : 'JPG'}
++            </button>
++          ))}
++        </div>
++        <button
++          onClick={() => void editor.download()}
++          disabled={!editor.canDownload}
++          className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold bg-gradient-to-r from-amber-500 to-orange-400 text-white shadow-lg shadow-amber-400/20 hover:from-amber-400 hover:to-orange-300 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
++        >
++          {editor.downloading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
++          {editor.downloading ? 'Creating image…' : `Download ${s.format === 'png' ? 'PNG' : 'JPG'}`}
++        </button>
++        {editor.downloadError && <p className="text-[11px] text-red-300">{editor.downloadError}</p>}
++        {editor.watermarked && (
++          <p className="text-[10px] text-zinc-500 leading-snug">Free covers include a small Captik watermark. Any paid plan, or unlocking this project, removes it.</p>
++        )}
++      </Section>
++    </div>
++  );
++}
+diff --git a/src/components/editor/cover/CoverPreview.tsx b/src/components/editor/cover/CoverPreview.tsx
+new file mode 100644
+index 0000000..a67464c
+--- /dev/null
++++ b/src/components/editor/cover/CoverPreview.tsx
+@@ -0,0 +1,56 @@
++'use client';
++
++// Fits the full-resolution CoverStage into the centre column with a uniform CSS scale, so what the user
++// sees is the exact DOM the download renders.
++
++import { useEffect, useRef, useState } from 'react';
++import { Loader2, ImageIcon } from 'lucide-react';
++import CoverStage from './CoverStage';
++import type { CoverEditor } from './useCoverEditor';
++
++export default function CoverPreview({ editor }: { editor: CoverEditor }) {
++  const boxRef = useRef<HTMLDivElement>(null);
++  const [size, setSize] = useState({ w: 0, h: 0 });
++
++  useEffect(() => {
++    const el = boxRef.current;
++    if (!el) return;
++    const ro = new ResizeObserver(([entry]) => {
++      const r = entry.contentRect;
++      setSize({ w: r.width, h: r.height });
++    });
++    ro.observe(el);
++    return () => ro.disconnect();
++  }, []);
++
++  const { stageProps, frameStatus, frameError, cutoutStatus, frame } = editor;
++  const W = stageProps.preset.width, H = stageProps.preset.height;
++  const pad = 24;
++  const scale = size.w > 0 && size.h > 0 ? Math.max(0.05, Math.min((size.w - pad) / W, (size.h - pad) / H)) : 0;
++
++  return (
++    <div ref={boxRef} data-cover-preview="" className="relative flex-1 min-w-0 min-h-0 h-full w-full flex items-center justify-center bg-[#0B0B0D] overflow-hidden">
++      {scale > 0 && (
++        <div className="relative rounded-md overflow-hidden shadow-2xl shadow-black/60 ring-1 ring-white/10" style={{ width: W * scale, height: H * scale }}>
++          <div style={{ width: W, height: H, transform: `scale(${scale})`, transformOrigin: 'top left' }}>
++            <CoverStage {...stageProps} onHeadlineMeasure={editor.onHeadlineMeasure} probeWidths={editor.probeWidths} />
++          </div>
++
++          {!frame && frameStatus !== 'capturing' && (
++            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-6 bg-black/40">
++              <ImageIcon className="w-6 h-6 text-zinc-500" />
++              <p className="text-xs text-zinc-300">{frameError || 'Scrub the timeline to pick a frame for your cover.'}</p>
++            </div>
++          )}
++          {(frameStatus === 'capturing' || cutoutStatus === 'working') && (
++            <div className="absolute top-2 left-2 flex items-center gap-1.5 rounded-full bg-black/70 px-2.5 py-1 text-[11px] text-zinc-200">
++              <Loader2 className="w-3 h-3 animate-spin" />
++              {frameStatus === 'capturing' ? 'Grabbing frame…' : 'Cutting out subject…'}
++            </div>
++          )}
++        </div>
++      )}
++      <span className="absolute bottom-2 right-3 text-[10px] text-zinc-600 font-mono">{W} × {H}</span>
++    </div>
++  );
++}
+diff --git a/src/components/editor/cover/CoverStage.tsx b/src/components/editor/cover/CoverStage.tsx
+new file mode 100644
+index 0000000..72d055f
+--- /dev/null
++++ b/src/components/editor/cover/CoverStage.tsx
+@@ -0,0 +1,217 @@
++'use client';
++
++// The cover, as DOM — the on-screen preview, and the headline + watermark layers of the downloaded image
++// (the still export mounts this exact component inside CoverComposition with `transparent`, then
++// composites the captured frame and cut-out pixels itself with the same coverFitRect).
++//
++// Layers, bottom → top:
++//   1. the captured frame, cover-fit (cropped, never letterboxed) with pan/zoom
++//   2. the headline — the real CaptionOverlay template at its logical size, uniformly scaled up
++//   3. the cut-out subject (same rect as the frame) when "subject in front" is on
++//   4. the free-tier watermark lockup (above the subject so it can never be hidden by it)
++//
++// Everything is absolutely positioned in OUTPUT pixels with no object-fit, so the web-renderer's
++// DOM composer and the browser lay it out identically.
++
++import { useEffect, useMemo, useRef } from 'react';
++import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
++import { buildFontsCss, buildIndicFontsCss } from '@/remotion/KineticCaptionComposition';
++import { WatermarkLockup } from '@/remotion/WatermarkLockup';
++import { CaptionOverlay } from '@/components/editor/CaptionOverlay';
++import {
++  coverFitRect, coverHeadlineWords, coverLogical, COVER_WATERMARK_T,
++  type CoverBox, type CoverPreset,
++} from '@/lib/cover/coverLayout';
++import { coverHeadlineKey, type HeadlineBounds, type HeadlineLayouts } from '@/lib/cover/headlinePlacement';
++
++export interface CoverStageProps {
++  preset:          CoverPreset;
++  /** Captured frame (same-origin blob: URL) and its intrinsic size. */
++  frameUrl:        string | null;
++  frameW:          number;
++  frameH:          number;
++  /** Cut-out of the SAME frame (transparent outside the subject), drawn above the headline. */
++  cutoutUrl?:      string | null;
++  panX:            number;
++  panY:            number;
++  zoom:            number;
++  text:            string;
++  styleId:         CaptionStyleId;
++  box:             CoverBox;
++  fontScale:       number;
++  accentColor:     string;
++  textColor:       string;
++  watermarked:     boolean;
++  /** No black ground: the still export renders the overlays transparent and composites the frame itself. */
++  transparent?:    boolean;
++  /** Fired once every image this stage renders has settled and been decoded — the export's capture gate.
++      `ok` is false when a layer has no pixels (failed load), so the export can fail instead of shipping it. */
++  onReady?:        (ok: boolean) => void;
++  /** Preview only: the headline's measured text runs, at the current box and at `probeWidths`, so the
++      editor can keep it clear of the subject. Not used by the still export. */
++  onHeadlineMeasure?: (m: HeadlineLayouts | null) => void;
++  /** Preview only: extra box widths to lay the headline out at, invisibly, for measurement. */
++  probeWidths?:    readonly number[];
++}
++
++const NO_BLEEPS: never[] = [];
++
++export default function CoverStage(p: CoverStageProps) {
++  const { preset } = p;
++  const W = preset.width, H = preset.height;
++  const logical = coverLogical(preset);
++  const rect = coverFitRect(p.frameW, p.frameH, W, H, p.panX, p.panY, p.zoom);
++  const headline = useMemo(() => coverHeadlineWords(p.text), [p.text]);
++  const fontsCss = useMemo(() => buildFontsCss() + buildIndicFontsCss(p.text), [p.text]);
++
++  // Image readiness: count the images that must decode before a capture is faithful.
++  const frameRef = useRef<HTMLImageElement>(null);
++  const cutRef = useRef<HTMLImageElement>(null);
++  const onReadyRef = useRef(p.onReady);
++  useEffect(() => { onReadyRef.current = p.onReady; }, [p.onReady]);
++  const showCutout = !!(p.cutoutUrl && p.frameUrl);
++  useEffect(() => {
++    const imgs = [p.frameUrl ? frameRef.current : null, showCutout ? cutRef.current : null]
++      .filter((x): x is HTMLImageElement => !!x);
++    let started = false;
++    let cancelled = false;
++    const check = async () => {
++      if (started || cancelled || !imgs.every(img => img.complete)) return;
++      started = true;
++      // `complete` is also true for a FAILED load, and a complete image is not necessarily decoded.
++      // Decode the actual nodes, then report whether every layer really has pixels — the export must
++      // fail (and retry) rather than download a cover whose frame silently didn't paint. Measured: a
++      // capture racing an image load exported headline + watermark on black.
++      await Promise.all(imgs.map(img => img.decode().catch(() => undefined)));
++      if (!cancelled) onReadyRef.current?.(imgs.every(img => img.naturalWidth > 0));
++    };
++    const onEvent = () => { void check(); };
++    imgs.forEach(img => { img.addEventListener('load', onEvent); img.addEventListener('error', onEvent); });
++    void check();
++    return () => {
++      cancelled = true;
++      imgs.forEach(img => { img.removeEventListener('load', onEvent); img.removeEventListener('error', onEvent); });
++    };
++  }, [p.frameUrl, p.cutoutUrl, showCutout]);
++
++  // Headline measurement (preview only). Templates differ in how their ink sits around the box anchor and
++  // how they wrap, so the editor measures rendered text rather than estimating it: every visible text run's
++  // line boxes, relative to the box anchor (transforms included, so the preview's scale cancels out). The
++  // probes are the same headline laid out invisibly at other widths, anchored at the cover centre.
++  const rootRef = useRef<HTMLDivElement>(null);
++  const headRef = useRef<HTMLDivElement>(null);
++  const probeRefs = useRef(new Map<number, HTMLDivElement>());
++  const onMeasureRef = useRef(p.onHeadlineMeasure);
++  const probeWidthsRef = useRef(p.probeWidths);
++  useEffect(() => { onMeasureRef.current = p.onHeadlineMeasure; probeWidthsRef.current = p.probeWidths; });
++  const wantsMeasure = !!p.onHeadlineMeasure;
++  const headKey = coverHeadlineKey({ text: p.text, styleId: p.styleId, fontScale: p.fontScale, box: p.box, preset: preset.id });
++  const probesKey = (p.probeWidths ?? []).join(',');
++  const anchorX = p.box.xPercent / 100;
++  const anchorY = p.box.yPercent / 100;
++  useEffect(() => {
++    if (!wantsMeasure) return;
++    let cancelled = false;
++    let raf = 0;
++
++    const runsIn = (el: HTMLElement, rr: DOMRect, ax: number, ay: number): HeadlineBounds[] => {
++      const runs: HeadlineBounds[] = [];
++      const range = document.createRange();
++      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
++      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
++        if (!n.textContent?.trim()) continue;
++        const parent = n.parentElement;
++        if (parent) {
++          const cs = getComputedStyle(parent);
++          if (cs.visibility === 'hidden' || cs.display === 'none') continue;
++        }
++        range.selectNodeContents(n);
++        for (const r of Array.from(range.getClientRects())) {
++          if (!r.width || !r.height) continue;
++          runs.push({
++            top: (r.top - rr.top) / rr.height - ay, bottom: (r.bottom - rr.top) / rr.height - ay,
++            left: (r.left - rr.left) / rr.width - ax, right: (r.right - rr.left) / rr.width - ax,
++          });
++        }
++      }
++      return runs;
++    };
++
++    const measure = () => {
++      const report = onMeasureRef.current;
++      if (cancelled || !report) return;
++      const root = rootRef.current;
++      const head = headRef.current;
++      if (!root || !head) { report(null); return; }
++      const rr = root.getBoundingClientRect();
++      if (!rr.width || !rr.height) return;
++      const current = runsIn(head, rr, anchorX, anchorY);
++      if (!current.length) { report(null); return; }
++      const byWidth = (probeWidthsRef.current ?? []).flatMap(w => {
++        const el = probeRefs.current.get(w);
++        const runs = el ? runsIn(el, rr, 0.5, 0.5) : [];
++        return runs.length ? [{ widthPercent: w, shape: { runs } }] : [];
++      });
++      report({ key: headKey, current: { runs: current }, byWidth });
++    };
++
++    // After layout, and after the template's fonts load — a fallback face wraps differently.
++    raf = requestAnimationFrame(() => {
++      void document.fonts.ready.then(() => { if (!cancelled) raf = requestAnimationFrame(measure); });
++    });
++    return () => { cancelled = true; cancelAnimationFrame(raf); };
++  }, [headKey, probesKey, wantsMeasure, anchorX, anchorY]);
++
++  const imgStyle: React.CSSProperties = {
++    position: 'absolute', left: rect.dx, top: rect.dy, width: rect.dw, height: rect.dh,
++    maxWidth: 'none', maxHeight: 'none', display: 'block', userSelect: 'none', pointerEvents: 'none',
++  };
++  const layer: React.CSSProperties = {
++    position: 'absolute', top: 0, left: 0, width: logical.w, height: logical.h,
++    transform: `scale(${logical.scale})`, transformOrigin: 'top left', pointerEvents: 'none',
++  };
++  const overlayProps = {
++    words: headline.words, segments: headline.segments, currentTimeMs: headline.currentTimeMs,
++    captionStyle: p.styleId, accentColor: p.accentColor, captionTextColor: p.textColor,
++    bleepRanges: NO_BLEEPS, captionFontScale: p.fontScale, captionLines: 'double' as const,
++    noLineFade: true, canvasWidthPx: logical.w,
++  };
++
++  return (
++    <div ref={rootRef} data-cover-stage="" style={{ position: 'relative', width: W, height: H, overflow: 'hidden', background: p.transparent ? 'transparent' : '#000', isolation: 'isolate' }}>
++      <style dangerouslySetInnerHTML={{ __html: fontsCss }} />
++      {p.frameUrl && (
++        // eslint-disable-next-line @next/next/no-img-element -- blob: URL of a captured frame; next/image cannot optimise it
++        <img ref={frameRef} src={p.frameUrl} alt="" draggable={false} style={imgStyle} />
++      )}
++      {headline.words.length > 0 && p.probeWidths?.map(w => (
++        <div
++          key={`probe-${w}`}
++          ref={(el) => { if (el) probeRefs.current.set(w, el); else probeRefs.current.delete(w); }}
++          aria-hidden
++          data-cover-probe={w}
++          style={{ ...layer, opacity: 0 }}
++        >
++          <CaptionOverlay {...overlayProps} captionXPercent={50} captionYPercent={50} captionWidthPercent={w} />
++        </div>
++      ))}
++      {headline.words.length > 0 && (
++        <div ref={headRef} style={layer}>
++          <CaptionOverlay
++            {...overlayProps}
++            captionXPercent={p.box.xPercent} captionYPercent={p.box.yPercent} captionWidthPercent={p.box.widthPercent}
++          />
++        </div>
++      )}
++      {showCutout && (
++        // eslint-disable-next-line @next/next/no-img-element -- blob: URL of the cut-out
++        <img ref={cutRef} src={p.cutoutUrl!} alt="" draggable={false} style={imgStyle} />
++      )}
++      {p.watermarked && (
++        <div style={layer}>
++          <WatermarkLockup t={COVER_WATERMARK_T} sz={(n: number) => Math.round(n * logical.rs)} />
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/src/components/editor/cover/useCoverEditor.ts b/src/components/editor/cover/useCoverEditor.ts
+new file mode 100644
+index 0000000..6a98145
+--- /dev/null
++++ b/src/components/editor/cover/useCoverEditor.ts
+@@ -0,0 +1,310 @@
++'use client';
++
++// Runtime state for the Cover editor: the captured frame, the cut-out, and the download.
++// Settings (what gets persisted in the project snapshot) are owned by the caller; everything here is
++// transient (blob: URLs, canvases, statuses) and rebuilt from the settings on demand.
++
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import type { TranscriptWord } from '@/types/transcript';
++import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
++import { capture } from '@/lib/analytics';
++import { captureFrameWithRecovery } from '@/lib/cover/frameCapture';
++import { canvasToObjectUrl, downloadBlob, renderCoverBlob } from '@/lib/cover/coverExport';
++import {
++  segmentStill, disposeStillSegmenter, StillCutoutError, type StillCutoutFailure,
++} from '@/lib/matte/subjectMatte';
++import {
++  coverPreset, coverSeedText, coverStyleFor, coverWatermarked, coverFileName,
++  defaultCoverSettings, defaultCoverBox, defaultCoverFontScale, cleanCoverText,
++  type CoverSettings, type CoverPresetId, type HookLike,
++} from '@/lib/cover/coverLayout';
++import {
++  coverHeadlineKey, coverProbeWidths, placeHeadline, shapeAt, subjectCoverage, type HeadlineLayouts,
++} from '@/lib/cover/headlinePlacement';
++import { subjectGridFor } from '@/lib/cover/subjectGrid';
++import type { CoverStageProps } from './CoverStage';
++
++export const CUTOUT_MESSAGES: Record<StillCutoutFailure, string> = {
++  unsupported:    "This browser can't cut out the subject. Try Chrome on a computer.",
++  load_failed:    "Couldn't load the cut-out model. Check your connection and try again.",
++  segment_failed: 'The cut-out failed on this frame. Try a different frame.',
++  no_subject:     'No person found in this frame. Pick a frame where the subject is clearly visible.',
++};
++
++export interface UseCoverEditorOpts {
++  open:              boolean;
++  settings:          CoverSettings | null;
++  onSettingsChange:  (s: CoverSettings) => void;
++  videoSrc:          string;
++  currentTimeMs:     number;
++  isPlaying:         boolean;
++  /** Exact capture from the visible player (VideoCanvasHandle.captureFrame). */
++  liveCapture?:      (tMs: number) => Promise<HTMLCanvasElement>;
++  /** Stored source bytes, for rebuilding a stale blob: URL. */
++  loadStoredBlob?:   () => Promise<Blob | null>;
++  hook:              HookLike | null;
++  words:             TranscriptWord[];
++  segments:          string[][];
++  projectStyle:      CaptionStyleId;
++  accentColor:       string;
++  textColor:         string;
++  plan:              string | null | undefined;
++  projectClean:      boolean;
++  /** False while a signed-in user's plan is still loading — downloads wait so a paid cover isn't watermarked. */
++  entitlementReady:  boolean;
++  fileBase?:         string | null;
++  onWatermarkedDownload?: () => void;
++}
++
++export type CoverFrameStatus = 'idle' | 'capturing' | 'ready' | 'error';
++export type CoverCutoutStatus = 'idle' | 'working' | 'ready' | 'error';
++
++interface FrameState { url: string; w: number; h: number; tMs: number }
++
++export function useCoverEditor(o: UseCoverEditorOpts) {
++  const settings = useMemo(() => o.settings ?? defaultCoverSettings(), [o.settings]);
++  const settingsRef = useRef(settings);
++  const onChangeRef = useRef(o.onSettingsChange);
++  useEffect(() => { settingsRef.current = settings; onChangeRef.current = o.onSettingsChange; });
++
++  const update = useCallback((patch: Partial<CoverSettings>) => {
++    onChangeRef.current({ ...settingsRef.current, ...patch });
++  }, []);
++
++  const [frame, setFrame] = useState<FrameState | null>(null);
++  const [frameStatus, setFrameStatus] = useState<CoverFrameStatus>('idle');
++  const [frameError, setFrameError] = useState('');
++  const [cutoutUrl, setCutoutUrl] = useState<string | null>(null);
++  const [cutoutCanvas, setCutoutCanvas] = useState<HTMLCanvasElement | null>(null);
++  const [cutoutStatus, setCutoutStatus] = useState<CoverCutoutStatus>('idle');
++  const [cutoutError, setCutoutError] = useState('');
++  const [downloading, setDownloading] = useState(false);
++  const [downloadError, setDownloadError] = useState('');
++  const [headMeasure, setHeadMeasure] = useState<HeadlineLayouts | null>(null);
++
++  const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
++  const cutoutCanvasRef = useRef<HTMLCanvasElement | null>(null);
++  const seqRef = useRef(0);
++  const lastCapturedMsRef = useRef<number | null>(null);
++  const urlsRef = useRef<{ frame: string | null; cutout: string | null }>({ frame: null, cutout: null });
++
++  const setFrameUrl = (next: FrameState | null) => {
++    if (urlsRef.current.frame && urlsRef.current.frame !== next?.url) URL.revokeObjectURL(urlsRef.current.frame);
++    urlsRef.current.frame = next?.url ?? null;
++    setFrame(next);
++  };
++  const setCutout = (url: string | null, canvas: HTMLCanvasElement | null) => {
++    if (urlsRef.current.cutout && urlsRef.current.cutout !== url) URL.revokeObjectURL(urlsRef.current.cutout);
++    urlsRef.current.cutout = url;
++    cutoutCanvasRef.current = canvas;
++    setCutoutUrl(url);
++    setCutoutCanvas(canvas);
++  };
++
++  // Latest inputs for async callbacks.
++  const inputsRef = useRef(o);
++  useEffect(() => { inputsRef.current = o; });
++
++  const runCutout = useCallback(async (canvas: HTMLCanvasElement, seq: number) => {
++    setCutoutStatus('working');
++    setCutoutError('');
++    try {
++      const out = await segmentStill(canvas);
++      if (seq !== seqRef.current) return;
++      const url = await canvasToObjectUrl(out, 'image/png');
++      if (seq !== seqRef.current) { URL.revokeObjectURL(url); return; }
++      setCutout(url, out);
++      setCutoutStatus('ready');
++    } catch (e) {
++      if (seq !== seqRef.current) return;
++      const reason: StillCutoutFailure = e instanceof StillCutoutError ? e.reason : 'segment_failed';
++      setCutout(null, null);
++      setCutoutStatus('error');
++      setCutoutError(CUTOUT_MESSAGES[reason]);
++      capture('cover_cutout_failed', { reason });
++      onChangeRef.current({ ...settingsRef.current, subjectInFront: false });
++    }
++  }, []);
++
++  const captureAt = useCallback(async (tMs: number, lock: boolean) => {
++    const seq = ++seqRef.current;
++    const inp = inputsRef.current;
++    setFrameStatus('capturing');
++    setFrameError('');
++    if (lock) onChangeRef.current({ ...settingsRef.current, frameMs: Math.max(0, Math.round(tMs)) });
++    try {
++      const canvas = await captureFrameWithRecovery({
++        tMs, src: inp.videoSrc, live: inp.liveCapture, loadStoredBlob: inp.loadStoredBlob,
++      });
++      if (seq !== seqRef.current) return;
++      const url = await canvasToObjectUrl(canvas, 'image/png');
++      if (seq !== seqRef.current) { URL.revokeObjectURL(url); return; }
++      frameCanvasRef.current = canvas;
++      lastCapturedMsRef.current = tMs;
++      setFrameUrl({ url, w: canvas.width, h: canvas.height, tMs });
++      setCutout(null, null);
++      setCutoutStatus('idle');
++      setFrameStatus('ready');
++      if (settingsRef.current.subjectInFront) void runCutout(canvas, seq);
++    } catch {
++      if (seq !== seqRef.current) return;
++      setFrameStatus('error');
++      setFrameError("Couldn't grab this frame. Try another point on the timeline.");
++    }
++  }, [runCutout]);
++
++  // Open: analytics, seed the headline, and bring in the frame (the locked one, else the playhead).
++  const wasOpenRef = useRef(false);
++  useEffect(() => {
++    if (!o.open) {
++      if (wasOpenRef.current) { seqRef.current++; disposeStillSegmenter(); }
++      wasOpenRef.current = false;
++      return;
++    }
++    if (wasOpenRef.current) return;
++    wasOpenRef.current = true;
++    capture('cover_opened', { restored: o.settings != null });
++    const s = settingsRef.current;
++    if (!s.text) {
++      const seed = coverSeedText(o.hook, o.words, o.segments);
++      if (seed.text) {
++        onChangeRef.current({ ...s, text: seed.text });
++        if (seed.source === 'hook_overlay' || seed.source === 'hook_script') capture('cover_seeded_from_hook', { source: seed.source });
++      }
++    }
++    void captureAt(s.frameMs ?? o.currentTimeMs, false);
++    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs on the open edge only
++  }, [o.open]);
++
++  // Follow the playhead while no frame is locked, so scrubbing the timeline previews the cover live.
++  const locked = settings.frameMs != null;
++  useEffect(() => {
++    if (!o.open || locked || o.isPlaying) return;
++    const last = lastCapturedMsRef.current;
++    if (last != null && Math.abs(last - o.currentTimeMs) < 20) return;
++    const t = setTimeout(() => { void captureAt(o.currentTimeMs, false); }, 300);
++    return () => clearTimeout(t);
++  }, [o.open, locked, o.isPlaying, o.currentTimeMs, captureAt]);
++
++  useEffect(() => () => {
++    seqRef.current++;
++    if (urlsRef.current.frame) URL.revokeObjectURL(urlsRef.current.frame);
++    if (urlsRef.current.cutout) URL.revokeObjectURL(urlsRef.current.cutout);
++    disposeStillSegmenter();
++  }, []);
++
++  const useCurrentFrame = useCallback(() => { void captureAt(inputsRef.current.currentTimeMs, true); }, [captureAt]);
++  const followPlayhead = useCallback(() => {
++    update({ frameMs: null });
++    lastCapturedMsRef.current = null;
++  }, [update]);
++
++  const setSubjectInFront = useCallback((on: boolean) => {
++    update({ subjectInFront: on });
++    setCutoutError('');
++    if (!on) return;
++    const canvas = frameCanvasRef.current;
++    if (canvas && !urlsRef.current.cutout) void runCutout(canvas, seqRef.current);
++  }, [update, runCutout]);
++
++  const setPreset = useCallback((id: CoverPresetId) => {
++    update({ preset: id, box: defaultCoverBox(id), boxAuto: true, fontScale: defaultCoverFontScale(id), panX: 0.5, panY: 0.5, zoom: 1 });
++  }, [update]);
++
++  const setText = useCallback((text: string, fromHook = false) => {
++    update({ text: fromHook ? cleanCoverText(text) : text.slice(0, 90) });
++    if (fromHook) capture('cover_seeded_from_hook', { source: 'hook_overlay_pick' });
++  }, [update]);
++
++  const watermarked = coverWatermarked(o.plan, o.projectClean);
++  const styleId = coverStyleFor(settings.styleId, o.projectStyle);
++  const preset = coverPreset(settings.preset);
++
++  // ── Keep the headline clear of the subject ────────────────────────────────
++  // With "subject in front" on, the cut-out is drawn over the headline. By default the headline moves to
++  // wherever the subject hides the least of it — a different height, or a narrower column beside a centred
++  // subject. Positioning or resizing the box by hand turns that off (settings.boxAuto).
++  const subjectShown = settings.subjectInFront && !!cutoutUrl && !!cutoutCanvas;
++  const autoPlacing = subjectShown && settings.boxAuto;
++  const probeWidths = useMemo(() => (autoPlacing ? coverProbeWidths(settings.preset) : undefined), [autoPlacing, settings.preset]);
++  const grid = useMemo(
++    () => (subjectShown && cutoutCanvas ? subjectGridFor(cutoutCanvas, preset, settings.panX, settings.panY, settings.zoom) : null),
++    [subjectShown, cutoutCanvas, preset, settings.panX, settings.panY, settings.zoom],
++  );
++  const headKey = coverHeadlineKey({
++    text: settings.text, styleId, fontScale: settings.fontScale, box: settings.box, preset: settings.preset,
++  });
++  // A measurement taken before the last text / size / position change describes a different layout.
++  const measured = headMeasure && headMeasure.key === headKey ? headMeasure : null;
++  const headlineCoverage = grid && measured
++    ? subjectCoverage(grid, shapeAt(measured.current, settings.box.xPercent, settings.box.yPercent))
++    : null;
++  const clearance = useMemo(
++    () => (autoPlacing && grid && measured ? placeHeadline({ grid, box: settings.box, preset: settings.preset, layouts: measured }) : null),
++    [autoPlacing, grid, measured, settings.box, settings.preset],
++  );
++  useEffect(() => {
++    if (!o.open || !clearance) return;
++    const b = settings.box;
++    const c = clearance.box;
++    if (Math.abs(c.xPercent - b.xPercent) < 1 && Math.abs(c.yPercent - b.yPercent) < 1 && Math.abs(c.widthPercent - b.widthPercent) < 1) return;
++    update({ box: c });
++  }, [o.open, clearance, settings.box, update]);
++  const clearOfSubject = useCallback(() => update({ boxAuto: true }), [update]);
++
++  const stageProps: Omit<CoverStageProps, 'onReady'> = {
++    preset,
++    frameUrl: frame?.url ?? null, frameW: frame?.w ?? 0, frameH: frame?.h ?? 0,
++    cutoutUrl: settings.subjectInFront ? cutoutUrl : null,
++    panX: settings.panX, panY: settings.panY, zoom: settings.zoom,
++    text: settings.text, styleId, box: settings.box, fontScale: settings.fontScale,
++    accentColor: o.accentColor, textColor: o.textColor, watermarked,
++  };
++
++  const canDownload = !!frame && frameStatus !== 'capturing' && cutoutStatus !== 'working' && o.entitlementReady && !downloading;
++
++  const stagePropsRef = useRef(stageProps);
++  useEffect(() => { stagePropsRef.current = stageProps; });
++
++  const download = useCallback(async () => {
++    const props = stagePropsRef.current;
++    const frameCanvas = frameCanvasRef.current;
++    if (!props.frameUrl || !frameCanvas) return;
++    // The export composites these pixels directly (see coverExport) — the cut-out only when it is shown.
++    const pixels = { frame: frameCanvas, cutout: props.cutoutUrl ? cutoutCanvasRef.current : null };
++    const s = settingsRef.current;
++    setDownloading(true);
++    setDownloadError('');
++    try {
++      let blob: Blob;
++      try {
++        blob = await renderCoverBlob(props, s.format, pixels);
++      } catch (first) {
++        // One retry: a transient renderer failure (font / mount) usually succeeds on the second try.
++        console.warn('[cover] render failed, retrying once', first);
++        blob = await renderCoverBlob(props, s.format, pixels);
++      }
++      downloadBlob(blob, coverFileName(props.preset, s.format, inputsRef.current.fileBase));
++      capture('cover_downloaded', {
++        size: props.preset.id, style: props.styleId, cutout: !!props.cutoutUrl, watermarked: props.watermarked, format: s.format,
++      });
++      // Covers never spend a watermark credit — a free cover just invites the upgrade.
++      if (props.watermarked) inputsRef.current.onWatermarkedDownload?.();
++    } catch (e) {
++      console.warn('[cover] download failed', e);
++      setDownloadError("Couldn't create the image. Please try again.");
++    } finally {
++      setDownloading(false);
++    }
++  }, []);
++
++  return {
++    settings, update, setPreset, setText, stageProps,
++    frame, frameStatus, frameError, locked, useCurrentFrame, followPlayhead,
++    cutoutStatus, cutoutError, setSubjectInFront,
++    subjectShown, headlineCoverage, clearOfSubject, onHeadlineMeasure: setHeadMeasure, probeWidths,
++    watermarked, canDownload, downloading, downloadError, download,
++  };
++}
++
++export type CoverEditor = ReturnType<typeof useCoverEditor>;
+diff --git a/src/lib/cover/coverExport.ts b/src/lib/cover/coverExport.ts
+new file mode 100644
+index 0000000..e5a2429
+--- /dev/null
++++ b/src/lib/cover/coverExport.ts
+@@ -0,0 +1,111 @@
++'use client';
++
++// Cover still export — in the user's browser, no cloud, no credits.
++//
++// The headline and watermark are rendered by @remotion/web-renderer from the SAME CoverStage the editor
++// previews (so the template looks identical), on a TRANSPARENT canvas. The captured frame and the
++// cut-out are NOT given to the renderer as <img> layers: they are composited here straight from the
++// canvases we already hold, using the same coverFitRect the preview uses. Measured: with image layers,
++// a render that raced the page's own use of the blob: URL exported headline + watermark on black while
++// every image reported loaded and decoded — compositing the pixels ourselves removes that failure class.
++
++import type { ComponentType } from 'react';
++import type { CoverCompositionProps } from '@/remotion/CoverComposition';
++import { coverFitRect, coverRenderPasses, cleanCoverText, type CoverFormat } from './coverLayout';
++
++export interface CoverPixels {
++  /** The captured frame at source resolution. */
++  frame:   HTMLCanvasElement;
++  /** Cut-out of the same frame (same size), or null when the subject is not in front. */
++  cutout?: HTMLCanvasElement | null;
++}
++
++async function renderOverlay(
++  props: CoverCompositionProps,
++  headline: boolean,
++  watermark: boolean,
++  signal?: AbortSignal,
++): Promise<OffscreenCanvas> {
++  const [{ renderStillOnWeb }, { CoverComposition }] = await Promise.all([
++    import('@remotion/web-renderer'),
++    import('@/remotion/CoverComposition'),
++  ]);
++  const inputProps: CoverCompositionProps = {
++    ...props,
++    frameUrl: null, cutoutUrl: null, frameW: 0, frameH: 0,
++    text: headline ? props.text : '',
++    watermarked: watermark,
++    transparent: true,
++  };
++  const result = await renderStillOnWeb({
++    composition: {
++      component: CoverComposition as unknown as ComponentType<Record<string, unknown>>,
++      id: 'CaptikCover',
++      width: props.preset.width,
++      height: props.preset.height,
++      fps: 30,
++      durationInFrames: 1,
++    },
++    frame:             0,
++    inputProps:        inputProps as unknown as Record<string, unknown>,
++    allowHtmlInCanvas: true,
++    licenseKey:        'free-license',
++    delayRenderTimeoutInMilliseconds: 30_000,
++    signal:            signal ?? null,
++  });
++  return result.canvas();
++}
++
++export async function renderCoverBlob(
++  props: CoverCompositionProps,
++  format: CoverFormat,
++  pixels: CoverPixels,
++  opts: { quality?: number; signal?: AbortSignal } = {},
++): Promise<Blob> {
++  const W = props.preset.width, H = props.preset.height;
++  const out = new OffscreenCanvas(W, H);
++  const ctx = out.getContext('2d');
++  if (!ctx) throw new Error('canvas-unavailable');
++  ctx.imageSmoothingEnabled = true;
++  ctx.imageSmoothingQuality = 'high';
++  ctx.fillStyle = '#000';
++  ctx.fillRect(0, 0, W, H);
++
++  const r = coverFitRect(pixels.frame.width, pixels.frame.height, W, H, props.panX, props.panY, props.zoom);
++  ctx.drawImage(pixels.frame, r.sx, r.sy, r.sw, r.sh, 0, 0, W, H);
++
++  const passes = coverRenderPasses({
++    hasText: !!cleanCoverText(props.text),
++    watermarked: props.watermarked,
++    hasCutout: !!pixels.cutout,
++  });
++  for (const pass of passes) {
++    if (pass.kind === 'cutout') {
++      ctx.drawImage(pixels.cutout!, r.sx, r.sy, r.sw, r.sh, 0, 0, W, H);
++    } else {
++      ctx.drawImage(await renderOverlay(props, pass.headline, pass.watermark, opts.signal), 0, 0, W, H);
++    }
++  }
++  return out.convertToBlob({
++    type: format === 'jpeg' ? 'image/jpeg' : 'image/png',
++    quality: format === 'jpeg' ? (opts.quality ?? 0.92) : undefined,
++  });
++}
++
++/** Same-origin anchor download (the pattern the video export uses). */
++export function downloadBlob(blob: Blob, fileName: string): void {
++  const a = document.createElement('a');
++  a.href = URL.createObjectURL(blob);
++  a.download = fileName;
++  document.body.appendChild(a);
++  a.click();
++  a.remove();
++  setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
++}
++
++/** Encode a canvas to a same-origin blob: URL for the preview's <img> layers (PNG keeps cut-out alpha). */
++export function canvasToObjectUrl(canvas: HTMLCanvasElement, type = 'image/png', quality?: number): Promise<string> {
++  return new Promise((resolve, reject) => {
++    canvas.toBlob((b) => (b ? resolve(URL.createObjectURL(b)) : reject(new Error('encode-failed'))), type, quality);
++  });
++}
+diff --git a/src/lib/cover/coverLayout.spec.ts b/src/lib/cover/coverLayout.spec.ts
+new file mode 100644
+index 0000000..1fba93f
+--- /dev/null
++++ b/src/lib/cover/coverLayout.spec.ts
+@@ -0,0 +1,224 @@
++import { describe, it, expect } from 'vitest';
++import type { TranscriptWord } from '@/types/transcript';
++import { activeSegmentWindowAt, resolveSegments } from '@/lib/captionSegments';
++import {
++  COVER_PRESETS, coverPreset, coverLogical, coverFitRect, defaultCoverBox, clampCoverBox,
++  isCoverStyleSupported, coverStyleFor, cleanCoverText, coverHeadlineWords, coverSeedText,
++  coverWatermarked, sanitizeCoverSettings, defaultCoverSettings, coverFileName, COVER_MAX_WORDS,
++  coverRenderPasses,
++} from './coverLayout';
++
++const w = (id: string, text: string, startMs: number, endMs: number): TranscriptWord =>
++  ({ id, text, startMs, endMs, styleOverride: {} });
++
++describe('presets + logical canvas', () => {
++  it('ships the three sizes', () => {
++    expect(COVER_PRESETS.map(p => [p.id, p.width, p.height])).toEqual([
++      ['reel', 1080, 1920], ['grid', 1080, 1350], ['youtube', 1280, 720],
++    ]);
++  });
++
++  it('unknown id falls back to Reels', () => {
++    expect(coverPreset('nope').id).toBe('reel');
++    expect(coverPreset(undefined).id).toBe('reel');
++  });
++
++  it('logical canvas scales EXACTLY onto the output pixels', () => {
++    for (const p of COVER_PRESETS) {
++      const l = coverLogical(p);
++      expect(Math.round(l.w * l.scale)).toBe(p.width);
++      expect(Math.round(l.h * l.scale)).toBe(p.height);
++    }
++    expect(coverLogical(coverPreset('reel'))).toEqual({ w: 270, h: 480, scale: 4, rs: 1 });
++    expect(coverLogical(coverPreset('youtube'))).toEqual({ w: 640, h: 360, scale: 2, rs: 1 });
++    const grid = coverLogical(coverPreset('grid'));
++    expect(grid.w).toBe(384);
++    expect(grid.rs).toBeCloseTo(384 / 270, 6);
++  });
++});
++
++describe('coverFitRect — fill + crop, never letterbox', () => {
++  it('landscape source into portrait crops the sides, centred', () => {
++    const r = coverFitRect(1920, 1080, 1080, 1920);
++    expect(r.dh).toBeCloseTo(1920);
++    expect(r.dw).toBeCloseTo(3413.33, 1);
++    expect(r.dy).toBe(0);
++    expect(r.dx).toBeCloseTo((1080 - 3413.33) / 2, 1);
++    // visible source strip: full height, 607.5 px wide centred
++    expect(r.sh).toBeCloseTo(1080);
++    expect(r.sw).toBeCloseTo(607.5, 1);
++    expect(r.sx).toBeCloseTo((1920 - 607.5) / 2, 1);
++  });
++
++  it('always covers the destination for any pan', () => {
++    for (const pan of [0, 0.25, 0.5, 1]) {
++      const r = coverFitRect(1080, 1920, 1280, 720, pan, pan);
++      expect(r.dx).toBeLessThanOrEqual(0);
++      expect(r.dy).toBeLessThanOrEqual(0);
++      expect(r.dx + r.dw).toBeGreaterThanOrEqual(1280 - 1e-6);
++      expect(r.dy + r.dh).toBeGreaterThanOrEqual(720 - 1e-6);
++    }
++  });
++
++  it('pan 0 shows the left/top edge, pan 1 the right/bottom edge', () => {
++    const left = coverFitRect(1920, 1080, 1080, 1920, 0, 0.5);
++    expect(left.sx).toBeCloseTo(0);
++    const right = coverFitRect(1920, 1080, 1080, 1920, 1, 0.5);
++    expect(right.sx + right.sw).toBeCloseTo(1920);
++  });
++
++  it('zoom enlarges and is clamped to [1,3]; out-of-range pan is clamped', () => {
++    const z2 = coverFitRect(1080, 1920, 1080, 1920, 0.5, 0.5, 2);
++    expect(z2.dw).toBeCloseTo(2160);
++    expect(z2.sw).toBeCloseTo(540);
++    expect(coverFitRect(1080, 1920, 1080, 1920, 0.5, 0.5, 0.2).dw).toBeCloseTo(1080);
++    expect(coverFitRect(1080, 1920, 1080, 1920, 0.5, 0.5, 99).dw).toBeCloseTo(3240);
++    expect(coverFitRect(1920, 1080, 1080, 1920, -5, 9)).toEqual(coverFitRect(1920, 1080, 1080, 1920, 0, 1));
++  });
++
++  it('degenerate sizes do not produce NaN', () => {
++    const r = coverFitRect(0, 0, 1080, 1920);
++    expect(Object.values(r).every(Number.isFinite)).toBe(true);
++  });
++});
++
++describe('headline box', () => {
++  it('clamps and fills missing fields from the fallback', () => {
++    const fb = defaultCoverBox('reel');
++    expect(clampCoverBox({ xPercent: -10, yPercent: 140, widthPercent: 5 }, fb)).toEqual({ xPercent: 0, yPercent: 100, widthPercent: 20 });
++    expect(clampCoverBox(null, fb)).toEqual(fb);
++    expect(clampCoverBox({ yPercent: NaN }, fb)).toEqual(fb);
++  });
++});
++
++describe('styles', () => {
++  it('excludes the html-in-canvas-mangled templates', () => {
++    for (const s of ['hormozi', 'captik_shadow', 'liquid_glass', 'illusion', 'editor_masala', 'aura', 'aura_helvetica', 'big_reveal', 'big_red']) {
++      expect(isCoverStyleSupported(s)).toBe(false);
++    }
++    expect(isCoverStyleSupported('mrbeast')).toBe(true);
++    // one-word-at-a-time templates would show a single word of the headline
++    expect(isCoverStyleSupported('pixelated')).toBe(false);
++    expect(isCoverStyleSupported('')).toBe(false);
++  });
++
++  it('coverStyleFor prefers the pick, then the project style, then the default', () => {
++    expect(coverStyleFor('boxed', 'mrbeast')).toBe('boxed');
++    expect(coverStyleFor('hormozi', 'boxed')).toBe('boxed');
++    expect(coverStyleFor(null, 'aura')).toBe('mrbeast');
++  });
++});
++
++describe('headline words', () => {
++  it('cleanCoverText collapses whitespace, strips wrapping quotes, caps length', () => {
++    expect(cleanCoverText('  "Stop   doing\nthis"  ')).toBe('Stop doing this');
++    expect(cleanCoverText(42)).toBe('');
++    expect(cleanCoverText('x'.repeat(200)).length).toBe(90);
++  });
++
++  it('builds one segment that is ACTIVE at currentTimeMs with every word already spoken', () => {
++    const { words, segments, currentTimeMs } = coverHeadlineWords('Nobody tells you this');
++    expect(words.map(x => x.text)).toEqual(['Nobody', 'tells', 'you', 'this']);
++    expect(segments).toEqual([words.map(x => x.id)]);
++    const win = activeSegmentWindowAt(resolveSegments(segments, words), currentTimeMs);
++    expect(win?.index).toBe(0);
++    for (const x of words) expect(x.startMs).toBeLessThan(currentTimeMs - 5_000);
++    // far from the line's exit: the window ends ≥ 1s after the sample
++    expect(win!.winEnd - currentTimeMs).toBeGreaterThanOrEqual(1_000);
++  });
++
++  it('caps words and handles empty text', () => {
++    expect(coverHeadlineWords(Array(30).fill('a').join(' ')).words).toHaveLength(COVER_MAX_WORDS);
++    expect(coverHeadlineWords('   ')).toMatchObject({ words: [], segments: [] });
++  });
++});
++
++describe('coverSeedText', () => {
++  const words = [w('a', 'yeh', 0, 300), w('b', 'dekho', 300, 600), w('c', 'next', 900, 1200)];
++  const segments = [['a', 'b'], ['c']];
++
++  it('hook overlay[0] wins', () => {
++    expect(coverSeedText({ overlays: ['“Paisa Kahan Gaya?”', 'x'], rewrittenScript: 'long script' }, words, segments))
++      .toEqual({ text: 'Paisa Kahan Gaya?', source: 'hook_overlay' });
++  });
++
++  it('then the rewritten script (word-capped)', () => {
++    const script = Array.from({ length: 15 }, (_, i) => `w${i}`).join(' ');
++    const r = coverSeedText({ overlays: ['   '], rewrittenScript: script }, words, segments);
++    expect(r.source).toBe('hook_script');
++    expect(r.text.split(' ')).toHaveLength(COVER_MAX_WORDS);
++  });
++
++  it('then the first caption line; then the first words when there are no segments', () => {
++    expect(coverSeedText(null, words, segments)).toEqual({ text: 'yeh dekho', source: 'caption' });
++    expect(coverSeedText(undefined, words, [])).toEqual({ text: 'yeh dekho next', source: 'caption' });
++  });
++
++  it('empty everything → none', () => {
++    expect(coverSeedText({ overlays: 'nope' }, [], null)).toEqual({ text: '', source: 'none' });
++  });
++});
++
++describe('coverWatermarked', () => {
++  it('free without a project unlock is watermarked', () => {
++    expect(coverWatermarked('free', false)).toBe(true);
++    expect(coverWatermarked(null, false)).toBe(true);
++    expect(coverWatermarked('garbage', false)).toBe(true);
++  });
++  it('any paid plan or the ₹9 project unlock is clean', () => {
++    for (const p of ['starter', 'editor', 'pro', 'premiere']) expect(coverWatermarked(p, false)).toBe(false);
++    expect(coverWatermarked('free', true)).toBe(false);
++  });
++});
++
++describe('sanitizeCoverSettings', () => {
++  it('garbage → defaults', () => {
++    expect(sanitizeCoverSettings(null)).toEqual(defaultCoverSettings('reel'));
++    expect(sanitizeCoverSettings('x')).toEqual(defaultCoverSettings('reel'));
++  });
++
++  it('keeps valid values, clamps ranges, drops unsupported styles', () => {
++    const s = sanitizeCoverSettings({
++      preset: 'youtube', frameMs: 1234, panX: 3, panY: 0.2, zoom: 9, text: '  hi  there ',
++      styleId: 'hormozi', box: { xPercent: 40, yPercent: 60, widthPercent: 70 }, fontScale: 99,
++      subjectInFront: true, format: 'jpeg',
++    });
++    expect(s).toEqual({
++      preset: 'youtube', frameMs: 1234, panX: 1, panY: 0.2, zoom: 3, text: 'hi there', styleId: null,
++      box: { xPercent: 40, yPercent: 60, widthPercent: 70 }, boxAuto: true, fontScale: 4, subjectInFront: true, format: 'jpeg',
++    });
++    expect(sanitizeCoverSettings({ styleId: 'boxed', frameMs: -1, subjectInFront: 'yes' })).toMatchObject({
++      styleId: 'boxed', frameMs: null, subjectInFront: false, format: 'png',
++    });
++  });
++});
++
++describe('coverFileName', () => {
++  it('names by base + size + format', () => {
++    expect(coverFileName(coverPreset('reel'), 'png', 'My Vlog #3.mp4')).toBe('My-Vlog-3-cover-1080x1920.png');
++    expect(coverFileName(coverPreset('youtube'), 'jpeg')).toBe('cover-1280x720.jpg');
++  });
++});
++
++describe('coverRenderPasses — still export layer order', () => {
++  it('no cut-out: one overlay carrying whatever is shown', () => {
++    expect(coverRenderPasses({ hasText: true, watermarked: true, hasCutout: false }))
++      .toEqual([{ kind: 'overlay', headline: true, watermark: true }]);
++    expect(coverRenderPasses({ hasText: false, watermarked: false, hasCutout: false })).toEqual([]);
++  });
++
++  it('cut-out: headline BELOW the subject, watermark ABOVE it', () => {
++    expect(coverRenderPasses({ hasText: true, watermarked: true, hasCutout: true })).toEqual([
++      { kind: 'overlay', headline: true, watermark: false },
++      { kind: 'cutout' },
++      { kind: 'overlay', headline: false, watermark: true },
++    ]);
++  });
++
++  it('clean cover with a cut-out renders no watermark pass', () => {
++    expect(coverRenderPasses({ hasText: true, watermarked: false, hasCutout: true })).toEqual([
++      { kind: 'overlay', headline: true, watermark: false },
++      { kind: 'cutout' },
++    ]);
++  });
++});
+diff --git a/src/lib/cover/coverLayout.ts b/src/lib/cover/coverLayout.ts
+new file mode 100644
+index 0000000..7c112f8
+--- /dev/null
++++ b/src/lib/cover/coverLayout.ts
+@@ -0,0 +1,297 @@
++// Cover / thumbnail layout — PURE geometry + settings for the "Cover" feature.
++//
++// A cover is a still image: one video frame, cover-fit (CROPPED, never letterboxed — the video
++// pipeline letterboxes, a thumbnail must fill), a headline rendered by the real CaptionOverlay
++// template, optionally the cut-out subject on top of the headline, and the free-tier watermark.
++//
++// Everything here is DOM-free and unit-tested (coverLayout.spec.ts) so the preview stage and the
++// exported PNG compute the IDENTICAL numbers.
++
++import type { TranscriptWord } from '@/types/transcript';
++import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
++import { logicalCanvasSize } from '@/lib/aspect';
++import { isWatermarkFreePlan, type PlanId } from '@/lib/tiers';
++import { isExcludedFromWysiwyg } from '@/lib/exportRouting';
++import { resolveSegments } from '@/lib/captionSegments';
++
++// ── presets ─────────────────────────────────────────────────────────────────
++
++export type CoverPresetId = 'reel' | 'grid' | 'youtube';
++
++export interface CoverPreset {
++  id:     CoverPresetId;
++  label:  string;
++  hint:   string;
++  width:  number;
++  height: number;
++}
++
++export const COVER_PRESETS: readonly CoverPreset[] = [
++  { id: 'reel',    label: 'Reels / Shorts', hint: '1080 × 1920', width: 1080, height: 1920 },
++  { id: 'grid',    label: 'Grid post',      hint: '1080 × 1350', width: 1080, height: 1350 },
++  { id: 'youtube', label: 'YouTube',        hint: '1280 × 720',  width: 1280, height: 720  },
++];
++
++export function coverPreset(id: CoverPresetId | string | null | undefined): CoverPreset {
++  return COVER_PRESETS.find(p => p.id === id) ?? COVER_PRESETS[0];
++}
++
++/**
++ * The logical caption canvas for a preset (CaptionOverlay's font pixels are tuned to it) and the
++ * uniform scale that maps it onto the output pixels — the same math the in-browser video export
++ * uses, so a headline looks exactly like that template does over video.
++ */
++export function coverLogical(preset: CoverPreset): { w: number; h: number; scale: number; rs: number } {
++  const { w, h } = logicalCanvasSize(preset.width / preset.height);
++  // Watermark sizing: RS = W<H ? W/270 : W/640 in LOGICAL px (src/remotion/Watermark.tsx).
++  const rs = w < h ? w / 270 : w / 640;
++  return { w, h, scale: preset.width / w, rs };
++}
++
++/**
++ * Time (s) the free-tier watermark lockup is frozen at: after its 0.45 s pop-in, at the peak of
++ * its 3 s breathe (sin = 1 at t = 0.75 + 3k) so a still carries it at full strength.
++ */
++export const COVER_WATERMARK_T = 3.75;
++
++// ── cover-fit crop ──────────────────────────────────────────────────────────
++
++export interface CoverRect {
++  /** Destination rect (output px) the whole source frame is drawn into — may overflow the canvas. */
++  dx: number; dy: number; dw: number; dh: number;
++  /** The visible part of the source, in source px (for canvas drawImage 9-arg form). */
++  sx: number; sy: number; sw: number; sh: number;
++}
++
++const clamp = (v: number, lo: number, hi: number) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo);
++
++export const COVER_ZOOM_MIN = 1;
++export const COVER_ZOOM_MAX = 3;
++
++/**
++ * Cover-fit the source into the destination (fill + crop), with pan and zoom.
++ * `panX`/`panY` ∈ [0,1]: 0 = show the left/top edge, 0.5 = centred, 1 = right/bottom edge.
++ * `zoom` ≥ 1 enlarges past the minimum fill.
++ */
++export function coverFitRect(
++  srcW: number, srcH: number, dstW: number, dstH: number,
++  panX = 0.5, panY = 0.5, zoom = 1,
++): CoverRect {
++  if (!(srcW > 0) || !(srcH > 0) || !(dstW > 0) || !(dstH > 0)) {
++    return { dx: 0, dy: 0, dw: Math.max(0, dstW), dh: Math.max(0, dstH), sx: 0, sy: 0, sw: Math.max(0, srcW), sh: Math.max(0, srcH) };
++  }
++  const scale = Math.max(dstW / srcW, dstH / srcH) * clamp(zoom, COVER_ZOOM_MIN, COVER_ZOOM_MAX);
++  const dw = srcW * scale;
++  const dh = srcH * scale;
++  const dx = (dstW - dw) * clamp(panX, 0, 1);
++  const dy = (dstH - dh) * clamp(panY, 0, 1);
++  return { dx, dy, dw, dh, sx: -dx / scale, sy: -dy / scale, sw: dstW / scale, sh: dstH / scale };
++}
++
++// ── headline box ────────────────────────────────────────────────────────────
++
++export interface CoverBox { xPercent: number; yPercent: number; widthPercent: number }
++
++export const COVER_FONT_SCALE_MIN = 0.6;
++export const COVER_FONT_SCALE_MAX = 4;
++
++/** Default headline box per preset: upper third on portrait (so a subject in front overlaps it). */
++export function defaultCoverBox(id: CoverPresetId): CoverBox {
++  if (id === 'youtube') return { xPercent: 50, yPercent: 30, widthPercent: 90 };
++  if (id === 'grid')    return { xPercent: 50, yPercent: 26, widthPercent: 88 };
++  return { xPercent: 50, yPercent: 28, widthPercent: 88 };
++}
++
++export function defaultCoverFontScale(id: CoverPresetId): number {
++  return id === 'youtube' ? 1.6 : 1.9;
++}
++
++export function clampCoverBox(b: Partial<CoverBox> | null | undefined, fallback: CoverBox): CoverBox {
++  const num = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
++  return {
++    xPercent:     clamp(num(b?.xPercent, fallback.xPercent), 0, 100),
++    yPercent:     clamp(num(b?.yPercent, fallback.yPercent), 0, 100),
++    widthPercent: clamp(num(b?.widthPercent, fallback.widthPercent), 20, 100),
++  };
++}
++
++// ── styles ──────────────────────────────────────────────────────────────────
++
++/**
++ * Templates the cover can render faithfully. The still export goes through @remotion/web-renderer's
++ * html-in-canvas, which mangles the WYSIWYG-excluded styles (gradient-clipped fills, backdrop glass,
++ * blend modes, SVG blur engines) — those are not offered for covers in v1.
++ */
++export function isCoverStyleSupported(id: string | null | undefined): boolean {
++  if (!id) return false;
++  return !isExcludedFromWysiwyg(id as CaptionStyleId) && !COVER_EXTRA_EXCLUDED.includes(id);
++}
++
++/**
++ * Templates that paint only the CURRENTLY SPOKEN word — as a still they show one word of the headline.
++ * Found by rendering every supported template as a cover (dev harness /cover-test?gallery=1).
++ */
++export const COVER_EXTRA_EXCLUDED: readonly string[] = ['pixelated'];
++
++/** The project's caption style when a cover can use it, else a safe bold default. */
++export const COVER_FALLBACK_STYLE: CaptionStyleId = 'mrbeast';
++export function coverStyleFor(preferred: string | null | undefined, projectStyle?: string | null): CaptionStyleId {
++  if (isCoverStyleSupported(preferred)) return preferred as CaptionStyleId;
++  if (isCoverStyleSupported(projectStyle)) return projectStyle as CaptionStyleId;
++  return COVER_FALLBACK_STYLE;
++}
++
++// ── headline text → synthetic caption words ─────────────────────────────────
++
++export const COVER_MAX_WORDS = 12;
++export const COVER_MAX_CHARS = 90;
++
++/** Normalise user / AI text into a headline: collapse whitespace, strip wrapping quotes, cap length. */
++export function cleanCoverText(raw: unknown): string {
++  if (typeof raw !== 'string') return '';
++  let t = raw.replace(/\s+/g, ' ').trim();
++  t = t.replace(/^["'“”‘’«»]+|["'“”‘’«»]+$/g, '').trim();
++  if (t.length > COVER_MAX_CHARS) t = t.slice(0, COVER_MAX_CHARS).trim();
++  return t;
++}
++
++const HOLD_MS = 60_000;
++const STEP_MS = 40;
++
++/**
++ * CaptionOverlay is time-based. To paint a whole headline as a still we hand it ONE segment whose
++ * words were all spoken long ago (every entrance animation has finished) while the LAST word stays
++ * "active" for a minute, and sample well inside that hold — far from the line's exit window.
++ */
++export function coverHeadlineWords(text: string): { words: TranscriptWord[]; segments: string[][]; currentTimeMs: number } {
++  const tokens = cleanCoverText(text).split(' ').filter(Boolean).slice(0, COVER_MAX_WORDS);
++  const words: TranscriptWord[] = tokens.map((tok, i) => ({
++    id:      `cover-w${i}`,
++    text:    tok,
++    startMs: i * STEP_MS,
++    endMs:   i === tokens.length - 1 ? HOLD_MS : (i + 1) * STEP_MS,
++    styleOverride: {},
++  }));
++  return {
++    words,
++    segments: words.length ? [words.map(w => w.id)] : [],
++    currentTimeMs: HOLD_MS - 1_000,
++  };
++}
++
++// ── seed text ───────────────────────────────────────────────────────────────
++
++export type CoverSeedSource = 'hook_overlay' | 'hook_script' | 'caption' | 'none';
++
++export interface HookLike { overlays?: unknown; rewrittenScript?: unknown }
++
++/** Seed: AI hook overlay[0] → AI rewritten script → the first caption line → empty. */
++export function coverSeedText(
++  hook: HookLike | null | undefined,
++  words: TranscriptWord[] | null | undefined,
++  segments: string[][] | null | undefined,
++): { text: string; source: CoverSeedSource } {
++  const overlay = Array.isArray(hook?.overlays) ? cleanCoverText(hook!.overlays[0]) : '';
++  if (overlay) return { text: overlay, source: 'hook_overlay' };
++  const script = cleanCoverText(hook?.rewrittenScript);
++  if (script) return { text: capWords(script), source: 'hook_script' };
++  const ws = words ?? [];
++  const first = resolveSegments(segments, ws)[0]?.sw ?? ws.slice(0, 6);
++  const line = cleanCoverText(first.map(w => w.text).join(' '));
++  if (line) return { text: capWords(line), source: 'caption' };
++  return { text: '', source: 'none' };
++}
++
++function capWords(t: string): string {
++  return t.split(' ').slice(0, COVER_MAX_WORDS).join(' ');
++}
++
++// ── entitlement ─────────────────────────────────────────────────────────────
++
++/**
++ * A cover is CLEAN when the plan is watermark-free OR this project carries the ₹9 per-project unlock.
++ * A one-shot wm credit is deliberately NOT considered — covers never spend credits.
++ */
++export function coverWatermarked(plan: PlanId | string | null | undefined, projectClean: boolean): boolean {
++  return !(isWatermarkFreePlan((plan ?? 'free') as PlanId) || projectClean);
++}
++
++// ── persisted settings ──────────────────────────────────────────────────────
++
++export type CoverFormat = 'png' | 'jpeg';
++
++export interface CoverSettings {
++  preset:         CoverPresetId;
++  /** Source time of the captured frame, or null when no frame has been captured yet. */
++  frameMs:        number | null;
++  panX:           number;
++  panY:           number;
++  zoom:           number;
++  text:           string;
++  /** Headline template; null = follow the project's caption style (when supported). */
++  styleId:        string | null;
++  box:            CoverBox;
++  /** Keep the headline clear of the cut-out subject automatically. Turns off once the user positions it. */
++  boxAuto:        boolean;
++  fontScale:      number;
++  subjectInFront: boolean;
++  format:         CoverFormat;
++}
++
++export function defaultCoverSettings(preset: CoverPresetId = 'reel'): CoverSettings {
++  return {
++    preset, frameMs: null, panX: 0.5, panY: 0.5, zoom: 1, text: '', styleId: null,
++    box: defaultCoverBox(preset), boxAuto: true, fontScale: defaultCoverFontScale(preset),
++    subjectInFront: false, format: 'png',
++  };
++}
++
++/** Guarded restore from a stored snapshot: anything malformed falls back to the defaults. */
++export function sanitizeCoverSettings(raw: unknown): CoverSettings {
++  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
++  const preset = coverPreset(typeof r.preset === 'string' ? r.preset : null).id;
++  const d = defaultCoverSettings(preset);
++  const num = (v: unknown, dflt: number, lo: number, hi: number) =>
++    (typeof v === 'number' && Number.isFinite(v) ? clamp(v, lo, hi) : dflt);
++  return {
++    preset,
++    frameMs:        typeof r.frameMs === 'number' && Number.isFinite(r.frameMs) && r.frameMs >= 0 ? r.frameMs : null,
++    panX:           num(r.panX, d.panX, 0, 1),
++    panY:           num(r.panY, d.panY, 0, 1),
++    zoom:           num(r.zoom, d.zoom, COVER_ZOOM_MIN, COVER_ZOOM_MAX),
++    text:           cleanCoverText(r.text),
++    styleId:        typeof r.styleId === 'string' && isCoverStyleSupported(r.styleId) ? r.styleId : null,
++    box:            clampCoverBox(r.box as Partial<CoverBox> | undefined, d.box),
++    boxAuto:        r.boxAuto !== false,
++    fontScale:      num(r.fontScale, d.fontScale, COVER_FONT_SCALE_MIN, COVER_FONT_SCALE_MAX),
++    subjectInFront: r.subjectInFront === true,
++    format:         r.format === 'jpeg' ? 'jpeg' : 'png',
++  };
++}
++
++export function coverFileName(preset: CoverPreset, format: CoverFormat, base?: string | null): string {
++  const stem = (base ?? '').replace(/\.[a-z0-9]{2,4}$/i, '').replace(/[^a-z0-9-_]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 40);
++  return `${stem ? `${stem}-` : ''}cover-${preset.width}x${preset.height}.${format === 'jpeg' ? 'jpg' : 'png'}`;
++}
++
++// ── still export pass plan ──────────────────────────────────────────────────
++
++export type CoverPass =
++  | { kind: 'overlay'; headline: boolean; watermark: boolean }
++  | { kind: 'cutout' };
++
++/**
++ * Layers composited ABOVE the frame, bottom → top. The headline sits under the cut-out subject; the
++ * watermark always sits on top so a subject can never hide it. Without a cut-out the headline and
++ * watermark share one overlay render. PURE.
++ */
++export function coverRenderPasses(o: { hasText: boolean; watermarked: boolean; hasCutout: boolean }): CoverPass[] {
++  if (!o.hasCutout) {
++    return o.hasText || o.watermarked ? [{ kind: 'overlay', headline: o.hasText, watermark: o.watermarked }] : [];
++  }
++  const passes: CoverPass[] = [];
++  if (o.hasText) passes.push({ kind: 'overlay', headline: true, watermark: false });
++  passes.push({ kind: 'cutout' });
++  if (o.watermarked) passes.push({ kind: 'overlay', headline: false, watermark: true });
++  return passes;
++}
+diff --git a/src/lib/cover/frameCapture.spec.ts b/src/lib/cover/frameCapture.spec.ts
+new file mode 100644
+index 0000000..6c4dca8
+--- /dev/null
++++ b/src/lib/cover/frameCapture.spec.ts
+@@ -0,0 +1,22 @@
++import { describe, it, expect } from 'vitest';
++import { clampFrameTimeSec } from './frameCapture';
++
++describe('clampFrameTimeSec', () => {
++  it('converts ms to seconds inside the playable range', () => {
++    expect(clampFrameTimeSec(1500, 10)).toBe(1.5);
++    expect(clampFrameTimeSec(0, 10)).toBe(0);
++  });
++
++  it('never seeks to or past the end (a seek to duration shows no frame)', () => {
++    expect(clampFrameTimeSec(10_000, 10)).toBeCloseTo(9.999, 6);
++    expect(clampFrameTimeSec(99_000, 10)).toBeCloseTo(9.999, 6);
++  });
++
++  it('negative / non-finite times clamp to 0; unknown duration leaves the time alone', () => {
++    expect(clampFrameTimeSec(-50, 10)).toBe(0);
++    expect(clampFrameTimeSec(NaN, 10)).toBe(0);
++    expect(clampFrameTimeSec(2500, NaN)).toBe(2.5);
++    expect(clampFrameTimeSec(2500, Infinity)).toBe(2.5);
++    expect(clampFrameTimeSec(2500, 0)).toBe(2.5);
++  });
++});
+diff --git a/src/lib/cover/frameCapture.ts b/src/lib/cover/frameCapture.ts
+new file mode 100644
+index 0000000..18ea2d4
+--- /dev/null
++++ b/src/lib/cover/frameCapture.ts
+@@ -0,0 +1,129 @@
++'use client';
++
++// Exact single-frame capture for covers.
++//
++// The editor's scrub path uses fastSeek (lands on a KEYFRAME) — fine for scrubbing, wrong for a
++// thumbnail: the frame you download would not be the frame you picked. Here we set currentTime
++// exactly, wait for `seeked`, then wait for the frame to actually be presented
++// (requestVideoFrameCallback, raced with a short timeout because a hidden/offscreen element may
++// never present), and draw at the SOURCE resolution.
++//
++// Sources are always same-origin blob: URLs, so the canvas is never tainted.
++
++/** Clamp a requested frame time into the playable range (a seek to `duration` shows nothing). */
++export function clampFrameTimeSec(tMs: number, durationSec: number): number {
++  const t = Number.isFinite(tMs) ? Math.max(0, tMs / 1000) : 0;
++  if (!(durationSec > 0) || !Number.isFinite(durationSec)) return t;
++  return Math.min(t, Math.max(0, durationSec - 0.001));
++}
++
++type VfcVideo = HTMLVideoElement & {
++  requestVideoFrameCallback?: (cb: () => void) => number;
++  cancelVideoFrameCallback?: (h: number) => void;
++};
++
++function waitEvent(el: HTMLMediaElement, ok: string, timeoutMs: number): Promise<void> {
++  return new Promise((resolve, reject) => {
++    const done = () => { cleanup(); resolve(); };
++    const fail = () => { cleanup(); reject(new Error('video-error')); };
++    const timer = setTimeout(() => { cleanup(); reject(new Error(`${ok}-timeout`)); }, timeoutMs);
++    const cleanup = () => {
++      clearTimeout(timer);
++      el.removeEventListener(ok, done);
++      el.removeEventListener('error', fail);
++    };
++    el.addEventListener(ok, done, { once: true });
++    el.addEventListener('error', fail, { once: true });
++  });
++}
++
++/** Resolve after the next presented frame, or after `timeoutMs` if the element never presents. */
++function waitPresented(video: HTMLVideoElement, timeoutMs = 250): Promise<void> {
++  const v = video as VfcVideo;
++  if (typeof v.requestVideoFrameCallback !== 'function') return new Promise(r => setTimeout(r, 30));
++  return new Promise((resolve) => {
++    let handle = 0;
++    const timer = setTimeout(() => { if (handle) v.cancelVideoFrameCallback?.(handle); resolve(); }, timeoutMs);
++    handle = v.requestVideoFrameCallback!(() => { clearTimeout(timer); resolve(); });
++  });
++}
++
++/** Seek EXACTLY (never fastSeek) and wait until the frame at that time is decoded. */
++export async function seekExact(video: HTMLVideoElement, tMs: number, timeoutMs = 8_000): Promise<void> {
++  if (video.readyState < 1) await waitEvent(video, 'loadedmetadata', timeoutMs);
++  const t = clampFrameTimeSec(tMs, video.duration);
++  if (Math.abs(video.currentTime - t) > 0.0005 || video.seeking) {
++    const seeked = waitEvent(video, 'seeked', timeoutMs);
++    video.currentTime = t;
++    await seeked;
++  }
++  if (video.readyState < 2) await waitEvent(video, 'loadeddata', timeoutMs).catch(() => {});
++  await waitPresented(video);
++}
++
++/** Draw the current frame at the source's intrinsic resolution. Throws if nothing is decodable. */
++export function drawVideoFrame(video: HTMLVideoElement): HTMLCanvasElement {
++  const w = video.videoWidth, h = video.videoHeight;
++  if (!w || !h || video.readyState < 2) throw new Error('frame-unavailable');
++  const canvas = document.createElement('canvas');
++  canvas.width = w; canvas.height = h;
++  const ctx = canvas.getContext('2d');
++  if (!ctx) throw new Error('canvas-unavailable');
++  ctx.drawImage(video, 0, 0, w, h);
++  return canvas;
++}
++
++/** Capture one exact frame from a src using a private offscreen <video> (does not touch the player). */
++export async function captureFrameFromSrc(src: string, tMs: number): Promise<HTMLCanvasElement> {
++  const video = document.createElement('video');
++  video.muted = true; video.playsInline = true; video.preload = 'auto';
++  const meta = waitEvent(video, 'loadeddata', 15_000);
++  video.src = src;
++  try {
++    await meta;
++    await seekExact(video, tMs);
++    return drawVideoFrame(video);
++  } finally {
++    video.removeAttribute('src');
++    try { video.load(); } catch { /* noop */ }
++  }
++}
++
++/** True when a blob:/same-origin URL can still be read (a reopened project can hold a revoked one). */
++export async function isSrcReadable(src: string): Promise<boolean> {
++  if (!src) return false;
++  try { const r = await fetch(src); return r.ok; } catch { return false; }
++}
++
++export interface CaptureWithRecoveryOpts {
++  tMs:  number;
++  src:  string;
++  /** Capture from the visible player (VideoCanvasHandle.captureFrame). Optional. */
++  live?: (tMs: number) => Promise<HTMLCanvasElement>;
++  /** Stored source bytes for a stale blob: URL (IndexedDB project record). */
++  loadStoredBlob?: () => Promise<Blob | null>;
++}
++
++/**
++ * Live player first; if that fails, the offscreen path — rebuilding a fresh blob: URL from the stored
++ * project bytes when the current URL is stale (same recovery the video export uses).
++ */
++export async function captureFrameWithRecovery(o: CaptureWithRecoveryOpts): Promise<HTMLCanvasElement> {
++  if (o.live) {
++    try { return await o.live(o.tMs); } catch { /* fall through to the offscreen path */ }
++  }
++  let src = o.src;
++  let made = false;
++  if (!(await isSrcReadable(src))) {
++    const blob = o.loadStoredBlob ? await o.loadStoredBlob().catch(() => null) : null;
++    if (!blob || blob.size === 0) throw new Error('source-unavailable');
++    src = URL.createObjectURL(blob);
++    made = true;
++  }
++  try {
++    return await captureFrameFromSrc(src, o.tMs);
++  } finally {
++    // The canvas already holds the pixels; the temporary URL is no longer needed.
++    if (made) URL.revokeObjectURL(src);
++  }
++}
+diff --git a/src/lib/cover/headlinePlacement.spec.ts b/src/lib/cover/headlinePlacement.spec.ts
+new file mode 100644
+index 0000000..14e44e1
+--- /dev/null
++++ b/src/lib/cover/headlinePlacement.spec.ts
+@@ -0,0 +1,155 @@
++import { describe, it, expect } from 'vitest';
++import { defaultCoverBox, defaultCoverSettings, sanitizeCoverSettings } from './coverLayout';
++import {
++  subjectCoverage, placeHeadline, headlineSafeBand, coverHeadlineKey, coverProbeWidths, shapeAt,
++  type SubjectGrid, type HeadlineShape,
++} from './headlinePlacement';
++
++/** A w×h grid whose rows [rowFrom, rowTo) are fully subject. */
++function rowsGrid(w: number, h: number, rowFrom: number, rowTo: number): SubjectGrid {
++  const alpha = new Float32Array(w * h);
++  for (let y = rowFrom; y < rowTo; y++) for (let x = 0; x < w; x++) alpha[y * w + x] = 1;
++  return { w, h, alpha };
++}
++
++/** A w×h grid whose columns [colFrom, colTo) are fully subject — a person standing in the middle. */
++function colsGrid(w: number, h: number, colFrom: number, colTo: number): SubjectGrid {
++  const alpha = new Float32Array(w * h);
++  for (let y = 0; y < h; y++) for (let x = colFrom; x < colTo; x++) alpha[y * w + x] = 1;
++  return { w, h, alpha };
++}
++
++/** A centred block of `lines` lines, each `lineH` tall with `gap` between, `halfW` either side of the anchor. */
++function block(lines: number, lineH: number, gap: number, halfW: number): HeadlineShape {
++  const total = lines * lineH + (lines - 1) * gap;
++  return {
++    runs: Array.from({ length: lines }, (_, i) => {
++      const top = -total / 2 + i * (lineH + gap);
++      return { top, bottom: top + lineH, left: -halfW, right: halfW };
++    }),
++  };
++}
++
++const box = defaultCoverBox('reel'); // x 50, y 28, width 88
++const oneLine = block(1, 0.06, 0, 0.4);
++
++describe('subjectCoverage', () => {
++  it('is 0 away from the subject, 1 fully behind it, and partial across its edge', () => {
++    const g = rowsGrid(20, 40, 0, 20); // top half is subject
++    expect(subjectCoverage(g, [{ top: 0.6, bottom: 0.7, left: 0, right: 1 }])).toBe(0);
++    expect(subjectCoverage(g, [{ top: 0.1, bottom: 0.2, left: 0, right: 1 }])).toBe(1);
++    expect(subjectCoverage(g, [{ top: 0.45, bottom: 0.55, left: 0, right: 1 }])).toBeCloseTo(0.5, 1);
++  });
++
++  it('counts the words, not the gap between lines', () => {
++    const g = rowsGrid(20, 40, 18, 22); // a subject band across y 0.45–0.55
++    const runs = [
++      { top: 0.40, bottom: 0.44, left: 0.2, right: 0.8 },
++      { top: 0.56, bottom: 0.60, left: 0.3, right: 0.7 },
++    ];
++    expect(subjectCoverage(g, runs)).toBe(0);
++  });
++
++  it('weights runs by area, so a long hidden line counts more than a short clear one', () => {
++    const g = rowsGrid(20, 40, 0, 20);
++    const cov = subjectCoverage(g, [
++      { top: 0.30, bottom: 0.35, left: 0.1, right: 0.9 },
++      { top: 0.60, bottom: 0.65, left: 0.4, right: 0.6 },
++    ]);
++    expect(cov).toBeCloseTo(0.8, 1);
++  });
++});
++
++describe('placeHeadline', () => {
++  it('moves a full-width headline just below a subject filling the top half, keeping its width', () => {
++    const r = placeHeadline({ grid: rowsGrid(20, 40, 0, 20), box, preset: 'reel', layouts: { current: oneLine, byWidth: [] } });
++    expect(r.coverage).toBe(0);
++    expect(r.box.widthPercent).toBe(88);
++    expect(r.box.xPercent).toBe(50);
++    expect(r.box.yPercent).toBeGreaterThanOrEqual(53);
++    expect(r.box.yPercent).toBeLessThanOrEqual(54);
++  });
++
++  it('leaves a headline that is already clear exactly where it is', () => {
++    const r = placeHeadline({ grid: rowsGrid(20, 40, 20, 40), box, preset: 'reel', layouts: { current: oneLine, byWidth: [] } });
++    expect(r.coverage).toBe(0);
++    expect(r.box).toEqual(box);
++  });
++
++  it('stays put when the subject fills the whole frame, since nowhere is clearer', () => {
++    const r = placeHeadline({ grid: rowsGrid(20, 40, 0, 40), box, preset: 'reel', layouts: { current: oneLine, byWidth: [] } });
++    expect(r.coverage).toBe(1);
++    expect(r.box).toEqual(box);
++  });
++
++  it('puts the headline in a narrow column beside a subject standing in the middle', () => {
++    const grid = colsGrid(40, 40, 17, 23); // subject across x 0.425–0.575, full height
++    const layouts = {
++      current: block(2, 0.06, 0.02, 0.42),
++      byWidth: [
++        { widthPercent: 88, shape: block(2, 0.06, 0.02, 0.42) },
++        { widthPercent: 52, shape: block(3, 0.06, 0.02, 0.24) },
++        { widthPercent: 40, shape: block(4, 0.06, 0.02, 0.18) },
++      ],
++    };
++    const r = placeHeadline({ grid, box, preset: 'reel', layouts });
++    expect(r.coverage).toBe(0);
++    expect(r.box.widthPercent).toBe(40);
++    expect([24, 76]).toContain(r.box.xPercent);
++    // A 4-line column is too tall for y 28 inside the grid-visible band, so it moves just enough to fit.
++    const shape = layouts.byWidth[2].shape;
++    const placed = shapeAt(shape, r.box.xPercent, r.box.yPercent);
++    expect(Math.min(...placed.map(p => p.top))).toBeGreaterThanOrEqual(headlineSafeBand('reel').top - 1e-9);
++  });
++
++  it('goes back to the full width once full width is clear again', () => {
++    const empty = rowsGrid(20, 40, 0, 0);
++    const narrowBox = { xPercent: 24, yPercent: 32, widthPercent: 40 };
++    const r = placeHeadline({
++      grid: empty, box: narrowBox, preset: 'reel',
++      layouts: {
++        current: block(4, 0.06, 0.02, 0.18),
++        byWidth: [{ widthPercent: 88, shape: block(2, 0.06, 0.02, 0.42) }],
++      },
++    });
++    expect(r.box).toEqual({ xPercent: 50, yPercent: 32, widthPercent: 88 });
++  });
++
++  it('leaves the grid-visible band only when that is the one clear place', () => {
++    const grid = rowsGrid(20, 40, 8, 40); // everything below y 0.2 is subject
++    const r = placeHeadline({ grid, box, preset: 'reel', layouts: { current: oneLine, byWidth: [] } });
++    expect(r.coverage).toBe(0);
++    expect(r.box.yPercent).toBe(17); // the nearest clear height: the line ends right where the subject starts
++  });
++
++  it('is stable: placing again from its own result changes nothing', () => {
++    const grid = colsGrid(40, 40, 17, 23);
++    const narrow = block(4, 0.06, 0.02, 0.18);
++    const layouts = { current: block(2, 0.06, 0.02, 0.42), byWidth: [{ widthPercent: 40, shape: narrow }] };
++    const first = placeHeadline({ grid, box, preset: 'reel', layouts });
++    const again = placeHeadline({
++      grid, box: first.box, preset: 'reel',
++      layouts: { current: narrow, byWidth: [{ widthPercent: 88, shape: block(2, 0.06, 0.02, 0.42) }, { widthPercent: 40, shape: narrow }] },
++    });
++    expect(again.box).toEqual(first.box);
++  });
++});
++
++describe('auto placement settings + measurement identity', () => {
++  it('is on by default, survives a restore, and is off only when stored off', () => {
++    expect(defaultCoverSettings('reel').boxAuto).toBe(true);
++    expect(sanitizeCoverSettings({}).boxAuto).toBe(true);
++    expect(sanitizeCoverSettings({ boxAuto: false }).boxAuto).toBe(false);
++  });
++
++  it('treats a measurement as stale once the box moves', () => {
++    const k = (y: number) => coverHeadlineKey({ text: 'Hi', styleId: 'mrbeast', fontScale: 1.9, box: { ...box, yPercent: y }, preset: 'reel' });
++    expect(k(28)).toBe(k(28));
++    expect(k(28)).not.toBe(k(40));
++  });
++
++  it('probes the preset default width plus two columns', () => {
++    expect(coverProbeWidths('reel')).toEqual([88, 52, 40]);
++    expect(coverProbeWidths('youtube')[0]).toBe(90);
++  });
++});
+diff --git a/src/lib/cover/headlinePlacement.ts b/src/lib/cover/headlinePlacement.ts
+new file mode 100644
+index 0000000..04031c3
+--- /dev/null
++++ b/src/lib/cover/headlinePlacement.ts
+@@ -0,0 +1,176 @@
++// Keeping the cover headline clear of the cut-out subject — PURE geometry, unit-tested in
++// headlinePlacement.spec.ts. With "subject in front" on, the subject is drawn OVER the headline, so a
++// headline left at the template's default spot can end up mostly hidden. This picks the box position —
++// and, when a full-width headline can't avoid a centred subject, a narrower column beside it — where
++// the subject hides the least of the headline's actual words.
++
++import { defaultCoverBox, type CoverBox, type CoverPresetId } from './coverLayout';
++
++/** The cut-out subject downsampled into COVER coordinates: alpha[row * w + col] ∈ [0, 1]. */
++export interface SubjectGrid { w: number; h: number; alpha: Float32Array }
++
++/** A rectangle as fractions (0–1) of the cover's width and height. */
++export interface HeadlineBounds { top: number; bottom: number; left: number; right: number }
++
++/**
++ * A headline's text runs (line fragments) RELATIVE TO ITS BOX ANCHOR, as fractions of the cover. Moving
++ * the box translates the runs rigidly; a different box width re-wraps the text, so each width has its own
++ * shape.
++ */
++export interface HeadlineShape { runs: readonly HeadlineBounds[] }
++
++/** What the stage measured for one headline (text, template, size, preset). */
++export interface HeadlineLayouts {
++  /** coverHeadlineKey of the box `current` was measured in — anything else makes the measurement stale. */
++  key:     string;
++  current: HeadlineShape;
++  /** The same headline laid out at other box widths (see coverProbeWidths). */
++  byWidth: readonly { widthPercent: number; shape: HeadlineShape }[];
++}
++
++/** Identity of a headline layout. A measurement only describes the exact text, template, size and box it came from. */
++export function coverHeadlineKey(o: {
++  text: string; styleId: string; fontScale: number; box: CoverBox; preset: CoverPresetId;
++}): string {
++  return [o.preset, o.styleId, o.text, o.fontScale, o.box.xPercent, o.box.yPercent, o.box.widthPercent].join('|');
++}
++
++/**
++ * Vertical room a headline should use, as fractions of the cover height. A Reels cover shows up on the
++ * profile grid cropped to its centre 1080×1350, so its headline prefers to stay inside that crop.
++ */
++export function headlineSafeBand(id: CoverPresetId): { top: number; bottom: number } {
++  if (id === 'reel') {
++    const crop = (1920 - 1350) / 2 / 1920;
++    return { top: crop + 0.02, bottom: 1 - crop - 0.02 };
++  }
++  return { top: 0.05, bottom: 0.95 };
++}
++
++/** Box widths the stage also lays the headline out at: the full default width, and two columns. */
++export function coverProbeWidths(id: CoverPresetId): number[] {
++  return [defaultCoverBox(id).widthPercent, 52, 40];
++}
++
++/** A shape's runs placed with the box anchor at (xPercent, yPercent). */
++export function shapeAt(shape: HeadlineShape, xPercent: number, yPercent: number): HeadlineBounds[] {
++  const dx = xPercent / 100;
++  const dy = yPercent / 100;
++  return shape.runs.map(r => ({ top: r.top + dy, bottom: r.bottom + dy, left: r.left + dx, right: r.right + dx }));
++}
++
++export function shapeBounds(runs: readonly HeadlineBounds[]): HeadlineBounds {
++  return {
++    top:    Math.min(...runs.map(r => r.top)),
++    bottom: Math.max(...runs.map(r => r.bottom)),
++    left:   Math.min(...runs.map(r => r.left)),
++    right:  Math.max(...runs.map(r => r.right)),
++  };
++}
++
++function rectCoverage(grid: SubjectGrid, r: HeadlineBounds): number {
++  const c0 = Math.max(0, Math.floor(r.left * grid.w));
++  const c1 = Math.min(grid.w, Math.ceil(r.right * grid.w));
++  const r0 = Math.max(0, Math.floor(r.top * grid.h));
++  const r1 = Math.min(grid.h, Math.ceil(r.bottom * grid.h));
++  let sum = 0;
++  let n = 0;
++  for (let y = r0; y < r1; y++) {
++    for (let x = c0; x < c1; x++) { sum += grid.alpha[y * grid.w + x]; n++; }
++  }
++  return n ? sum / n : 0;
++}
++
++/**
++ * How much of a headline the subject hides: mean subject alpha over its text runs, weighted by area.
++ * Runs, not the bounding box — a multi-line headline's box includes the gaps between lines, and subject
++ * showing through a gap hides nothing. 0 = fully readable, 1 = entirely behind the subject.
++ */
++export function subjectCoverage(grid: SubjectGrid, runs: readonly HeadlineBounds[]): number {
++  let sum = 0;
++  let area = 0;
++  for (const run of runs) {
++    const a = Math.max(0, run.right - run.left) * Math.max(0, run.bottom - run.top);
++    if (!a) continue;
++    sum += rectCoverage(grid, run) * a;
++    area += a;
++  }
++  return area ? sum / area : 0;
++}
++
++/** Candidates within this much of the best cost count as equally good. */
++export const HEADLINE_CLEAR_TOLERANCE = 0.02;
++/** Keep this far (fraction of the cover) from every edge. */
++const EDGE = 0.03;
++/** Leaving the grid-visible band must clear this much more of the headline to be worth it. */
++const OUT_OF_BAND_PENALTY = 0.08;
++/** A narrower column than the template default must clear this much more to be worth it. */
++const NARROW_PENALTY = 0.04;
++/** Side columns sit this many percent from the cover edge. */
++const COLUMN_MARGIN = 4;
++const Y_STEP = 0.5;
++
++/**
++ * The box that lets the subject hide the least of the headline.
++ *
++ * Candidates: the current layout at every height, the full default width centred, and each narrower
++ * probe width as a left or right column, all at every height. Cost = coverage, plus a penalty for leaving
++ * the grid-visible band and for shrinking the column, so the headline only moves somewhere unusual when
++ * that genuinely clears it. Among near-equal candidates the smallest change wins — the current layout
++ * first, then the nearest position — so a headline that is already clear never moves and the placement
++ * is stable when re-run on its own result. Returns the box and the coverage there.
++ */
++export function placeHeadline(o: {
++  grid: SubjectGrid;
++  box: CoverBox;
++  preset: CoverPresetId;
++  layouts: Pick<HeadlineLayouts, 'current' | 'byWidth'>;
++}): { box: CoverBox; coverage: number } {
++  const band = headlineSafeBand(o.preset);
++  const fullWidth = defaultCoverBox(o.preset).widthPercent;
++  type Candidate = { box: CoverBox; coverage: number; cost: number; change: number };
++  const candidates: Candidate[] = [];
++
++  const consider = (shape: HeadlineShape, widthPercent: number, xs: number[], isCurrent: boolean) => {
++    if (!shape.runs.length) return;
++    const rel = shapeBounds(shape.runs);
++    const narrow = widthPercent < fullWidth - 0.5;
++    for (const x of xs) {
++      if (x / 100 + rel.left < EDGE || x / 100 + rel.right > 1 - EDGE) continue;
++      for (let y = 5; y <= 95 + 1e-9; y += Y_STEP) {
++        const top = y / 100 + rel.top;
++        const bottom = y / 100 + rel.bottom;
++        if (top < EDGE || bottom > 1 - EDGE) continue;
++        const coverage = subjectCoverage(o.grid, shapeAt(shape, x, y));
++        const inBand = top >= band.top - 1e-9 && bottom <= band.bottom + 1e-9;
++        candidates.push({
++          box: { xPercent: x, yPercent: y, widthPercent },
++          coverage,
++          cost: coverage + (inBand ? 0 : OUT_OF_BAND_PENALTY) + (narrow ? NARROW_PENALTY : 0),
++          change: (isCurrent ? 0 : 1000) + Math.abs(y - o.box.yPercent) + Math.abs(x - o.box.xPercent),
++        });
++      }
++    }
++  };
++
++  consider(o.layouts.current, o.box.widthPercent, [o.box.xPercent], true);
++  for (const alt of o.layouts.byWidth) {
++    if (Math.abs(alt.widthPercent - o.box.widthPercent) < 0.5) continue;
++    const xs = alt.widthPercent >= fullWidth - 0.5
++      ? [50]
++      : [COLUMN_MARGIN + alt.widthPercent / 2, 100 - COLUMN_MARGIN - alt.widthPercent / 2];
++    consider(alt.shape, alt.widthPercent, xs, false);
++  }
++
++  if (!candidates.length) {
++    return { box: o.box, coverage: subjectCoverage(o.grid, shapeAt(o.layouts.current, o.box.xPercent, o.box.yPercent)) };
++  }
++  const min = Math.min(...candidates.map(c => c.cost));
++  let best = candidates[0];
++  let bestChange = Infinity;
++  for (const c of candidates) {
++    if (c.cost > min + HEADLINE_CLEAR_TOLERANCE) continue;
++    if (c.change < bestChange) { best = c; bestChange = c.change; }
++  }
++  return { box: best.box, coverage: best.coverage };
++}
+diff --git a/src/lib/cover/subjectGrid.ts b/src/lib/cover/subjectGrid.ts
+new file mode 100644
+index 0000000..b4a9742
+--- /dev/null
++++ b/src/lib/cover/subjectGrid.ts
+@@ -0,0 +1,34 @@
++// Downsamples the cut-out's alpha into the cover's OWN coordinates — the same cover-fit crop, pan and
++// zoom the stage draws it with — so headline placement reasons about exactly what the cover shows.
++// Browser-only (canvas); the placement maths it feeds is pure (headlinePlacement.ts).
++
++import { coverFitRect, type CoverPreset } from './coverLayout';
++import type { SubjectGrid } from './headlinePlacement';
++
++export function subjectGridFor(
++  cutout: HTMLCanvasElement,
++  preset: CoverPreset,
++  panX: number,
++  panY: number,
++  zoom: number,
++  cols = 54,
++): SubjectGrid | null {
++  if (!cutout.width || !cutout.height) return null;
++  const rows = Math.max(1, Math.round((cols * preset.height) / preset.width));
++  const rect = coverFitRect(cutout.width, cutout.height, preset.width, preset.height, panX, panY, zoom);
++  const k = cols / preset.width;
++
++  const canvas = document.createElement('canvas');
++  canvas.width = cols;
++  canvas.height = rows;
++  const ctx = canvas.getContext('2d', { willReadFrequently: true });
++  if (!ctx) return null;
++  ctx.imageSmoothingEnabled = true;
++  ctx.imageSmoothingQuality = 'high';
++  ctx.drawImage(cutout, rect.dx * k, rect.dy * k, rect.dw * k, rect.dh * k);
++
++  const data = ctx.getImageData(0, 0, cols, rows).data;
++  const alpha = new Float32Array(cols * rows);
++  for (let i = 0; i < alpha.length; i++) alpha[i] = data[i * 4 + 3] / 255;
++  return { w: cols, h: rows, alpha };
++}
+diff --git a/src/lib/matte/subjectMatte.spec.ts b/src/lib/matte/subjectMatte.spec.ts
+index 6140677..07590b8 100644
+--- a/src/lib/matte/subjectMatte.spec.ts
++++ b/src/lib/matte/subjectMatte.spec.ts
+@@ -1,5 +1,5 @@
+ import { describe, it, expect } from 'vitest';
+-import { subjectMatteWindows, allCaptionWindows, matteSourceSig } from './subjectMatte';
++import { subjectMatteWindows, allCaptionWindows, matteSourceSig, confidenceToAlpha, maskAlphaBytes, alphaCoverage } from './subjectMatte';
+ import type { TranscriptWord, LineOverride } from '@/types/transcript';
+ 
+ // Minimal word factory — only the fields subjectMatteWindows reads matter.
+@@ -97,3 +97,42 @@ describe('matteSourceSig', () => {
+     expect(matteSourceSig('src1', 25, [{ startMs: 0, endMs: 1000 }])).not.toBe(base);
+   });
+ });
++
++describe('confidence → alpha ramp (shared by the matte and the cover cut-out)', () => {
++  it('multiclass: alpha = 1 − background confidence, ramped 0.30 → 0.70', () => {
++    expect(confidenceToAlpha(1, true)).toBe(0);        // pure background
++    expect(confidenceToAlpha(0.7, true)).toBeCloseTo(0, 10); // subject 0.30 → edge of transparent (float: 1−0.7 ≈ 0.30000000000000004)
++    expect(confidenceToAlpha(0.5, true)).toBeCloseTo(0.5, 10);
++    expect(confidenceToAlpha(0.3, true)).toBe(1);      // subject 0.70 → fully opaque
++    expect(confidenceToAlpha(0, true)).toBe(1);
++  });
++
++  it('single-class: the mask already is the subject', () => {
++    expect(confidenceToAlpha(0.1, false)).toBe(0);
++    expect(confidenceToAlpha(0.6, false)).toBeCloseTo(0.75, 10);
++    expect(confidenceToAlpha(0.95, false)).toBe(1);
++  });
++
++  it('is monotonic across the ramp', () => {
++    let prev = -1;
++    for (let s = 0; s <= 100; s++) {
++      const a = confidenceToAlpha(s / 100, false);
++      expect(a).toBeGreaterThanOrEqual(prev);
++      prev = a;
++    }
++  });
++
++  it('maskAlphaBytes writes white pixels with the ramped alpha, reusing a right-sized buffer', () => {
++    const buf = new Uint8ClampedArray(12);
++    const px = maskAlphaBytes([1, 0.5, 0], true, buf);
++    expect(px).toBe(buf);
++    expect(Array.from(px)).toEqual([255, 255, 255, 0, 255, 255, 255, 128, 255, 255, 255, 255]);
++    expect(maskAlphaBytes([0.5], true, new Uint8ClampedArray(3))).toHaveLength(4);
++  });
++
++  it('alphaCoverage counts pixels at or above the threshold', () => {
++    expect(alphaCoverage([255, 255, 255, 0, 255, 255, 255, 128, 255, 255, 255, 255])).toBeCloseTo(2 / 3, 10);
++    expect(alphaCoverage([255, 255, 255, 127])).toBe(0);
++    expect(alphaCoverage([])).toBe(0);
++  });
++});
+diff --git a/src/lib/matte/subjectMatte.ts b/src/lib/matte/subjectMatte.ts
+index 6c4070c..c97c23a 100644
+--- a/src/lib/matte/subjectMatte.ts
++++ b/src/lib/matte/subjectMatte.ts
+@@ -182,6 +182,178 @@ export class SubjectMatte {
+   close() { for (const b of this.cache.values()) { try { b.close(); } catch {} } this.cache.clear(); this.blobs.clear(); this.onDecoded = undefined; }
+ }
+ 
++// ── confidence mask → alpha (shared by the per-frame matte and the single-frame cover cut-out) ──
++
++/** Soft edge: confidence ≤ LO is fully transparent, ≥ HI fully opaque, linear in between. */
++export const MATTE_RAMP_LO = 0.30;
++export const MATTE_RAMP_HI = 0.70;
++
++/**
++ * Subject alpha (0..1) from one mask sample. The multiclass selfie model's mask[0] is BACKGROUND
++ * confidence, so subject = 1 − it; a single-class model's mask already is the subject. PURE.
++ */
++export function confidenceToAlpha(c: number, multiclass: boolean): number {
++  const a = multiclass ? 1 - c : c;
++  return a <= MATTE_RAMP_LO ? 0 : a >= MATTE_RAMP_HI ? 1 : (a - MATTE_RAMP_LO) / (MATTE_RAMP_HI - MATTE_RAMP_LO);
++}
++
++/** White RGBA bytes whose alpha is the subject mask. PURE (no canvas). */
++export function maskAlphaBytes(data: ArrayLike<number>, multiclass: boolean, out?: Uint8ClampedArray): Uint8ClampedArray {
++  const px = out && out.length === data.length * 4 ? out : new Uint8ClampedArray(data.length * 4);
++  for (let i = 0; i < data.length; i++) {
++    const o = i * 4;
++    px[o] = 255; px[o + 1] = 255; px[o + 2] = 255;
++    px[o + 3] = Math.round(confidenceToAlpha(data[i], multiclass) * 255);
++  }
++  return px;
++}
++
++/** Fraction of pixels whose alpha is ≥ `threshold` (0..255). PURE. */
++export function alphaCoverage(rgba: ArrayLike<number>, threshold = 128): number {
++  const n = Math.floor(rgba.length / 4);
++  if (!n) return 0;
++  let hit = 0;
++  for (let i = 3; i < rgba.length; i += 4) if (rgba[i] >= threshold) hit++;
++  return hit / n;
++}
++
++/** Structural subset of MediaPipe's MPMask that the compositor reads. */
++export interface ConfidenceMaskLike { width: number; height: number; getAsFloat32Array(): Float32Array }
++
++export interface MaskScratch { canvas: OffscreenCanvas | null; ctx: OffscreenCanvasRenderingContext2D | null }
++export const newMaskScratch = (): MaskScratch => ({ canvas: null, ctx: null });
++
++/**
++ * Keep only the subject on `ctx` (which already holds the frame, `outW`×`outH`): builds the alpha
++ * mask from the confidence masks and composites it `destination-in`. With NO mask the frame is
++ * cleared, so an opaque frame is never baked as a "cut-out". Returns the mask's subject coverage
++ * (0..1) so callers can tell an empty cut-out from a real one. The caller still owns
++ * `result.close()`.
++ */
++export function applyConfidenceMask(
++  ctx:     OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D,
++  masks:   readonly ConfidenceMaskLike[] | undefined,
++  outW:    number,
++  outH:    number,
++  scratch: MaskScratch,
++): number {
++  if (!masks || !masks.length) { ctx.clearRect(0, 0, outW, outH); return 0; }
++  const bg = masks[0]; const mw = bg.width, mh = bg.height;
++  if (!scratch.canvas || scratch.canvas.width !== mw || scratch.canvas.height !== mh) {
++    scratch.canvas = new OffscreenCanvas(mw, mh);
++    scratch.ctx = scratch.canvas.getContext('2d', { alpha: true }) as OffscreenCanvasRenderingContext2D;
++  }
++  const img = scratch.ctx!.createImageData(mw, mh);
++  maskAlphaBytes(bg.getAsFloat32Array(), masks.length > 1, img.data);
++  scratch.ctx!.putImageData(img, 0, 0);
++  ctx.save();
++  ctx.globalCompositeOperation = 'destination-in';
++  ctx.imageSmoothingEnabled = true;
++  ctx.drawImage(scratch.canvas, 0, 0, outW, outH);
++  ctx.restore();
++  return alphaCoverage(img.data);
++}
++
++// ── single-frame cut-out (covers) ──────────────────────────────────────────
++
++export type StillCutoutFailure = 'unsupported' | 'load_failed' | 'segment_failed' | 'no_subject';
++
++export class StillCutoutError extends Error {
++  readonly reason: StillCutoutFailure;
++  constructor(reason: StillCutoutFailure, message?: string) {
++    super(message ?? reason);
++    this.name = 'StillCutoutError';
++    this.reason = reason;
++  }
++}
++
++type Segmenter = import('@mediapipe/tasks-vision').ImageSegmenter;
++type Delegate = 'GPU' | 'CPU';
++const stillSegmenters: Partial<Record<Delegate, Promise<Segmenter>>> = {};
++
++/** Lazily create (once per delegate) an IMAGE-mode segmenter — `segment()` refuses VIDEO mode. */
++function stillSegmenter(delegate: Delegate): Promise<Segmenter> {
++  let p = stillSegmenters[delegate];
++  if (!p) {
++    p = (async () => {
++      const vision = await import('@mediapipe/tasks-vision');
++      const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
++      return vision.ImageSegmenter.createFromOptions(fileset, {
++        baseOptions: { modelAssetPath: MODEL_PATH, delegate },
++        runningMode: 'IMAGE', outputCategoryMask: false, outputConfidenceMasks: true,
++      });
++    })();
++    stillSegmenters[delegate] = p;
++    // A failed load must not poison the cache — the next tap retries.
++    p.catch(() => { if (stillSegmenters[delegate] === p) delete stillSegmenters[delegate]; });
++  }
++  return p;
++}
++
++/** Release the cached still segmenters (GPU context + wasm heap). Safe to call anytime. */
++export function disposeStillSegmenter(): void {
++  for (const d of ['GPU', 'CPU'] as const) {
++    const p = stillSegmenters[d];
++    delete stillSegmenters[d];
++    p?.then(s => { try { s.close(); } catch { /* noop */ } }).catch(() => {});
++  }
++}
++
++/**
++ * Cut the subject out of ONE captured frame. Returns a canvas the size of `source` holding the frame's
++ * pixels with everything but the person transparent — segmenting the captured canvas (not the live
++ * video) guarantees frame and mask pixels match.
++ *
++ * Unlike the per-frame matte (which swallows segmenter exceptions into an empty frame), an empty
++ * result here is an ERROR: GPU first, then one CPU retry (the GPU delegate can fail to create or return
++ * an empty mask on some drivers), then a typed StillCutoutError the UI can explain.
++ */
++export async function segmentStill(
++  source: HTMLCanvasElement,
++  opts: { minCoverage?: number } = {},
++): Promise<HTMLCanvasElement> {
++  if (!canGenerateMatte()) throw new StillCutoutError('unsupported');
++  const w = source.width, h = source.height;
++  if (!w || !h) throw new StillCutoutError('segment_failed', 'empty-source');
++  const minCoverage = opts.minCoverage ?? 0.005;
++  const scratch = newMaskScratch();
++
++  const attempt = async (delegate: Delegate): Promise<HTMLCanvasElement> => {
++    let seg: Segmenter;
++    try { seg = await stillSegmenter(delegate); }
++    catch (e) { throw new StillCutoutError('load_failed', e instanceof Error ? e.message : String(e)); }
++    let result: import('@mediapipe/tasks-vision').ImageSegmenterResult | undefined;
++    try { result = seg.segment(source); }
++    catch (e) { throw new StillCutoutError('segment_failed', e instanceof Error ? e.message : String(e)); }
++    try {
++      const out = document.createElement('canvas');
++      out.width = w; out.height = h;
++      const ctx = out.getContext('2d');
++      if (!ctx) throw new StillCutoutError('segment_failed', 'canvas-unavailable');
++      ctx.drawImage(source, 0, 0, w, h);
++      const coverage = applyConfidenceMask(ctx, result?.confidenceMasks, w, h, scratch);
++      if (coverage < minCoverage) throw new StillCutoutError('no_subject');
++      return out;
++    } finally {
++      result?.close?.();
++    }
++  };
++
++  try {
++    return await attempt('GPU');
++  } catch (gpuErr) {
++    try {
++      return await attempt('CPU');
++    } catch (cpuErr) {
++      // Prefer the more informative reason: a real "no person" beats a GPU load failure.
++      const a = gpuErr instanceof StillCutoutError ? gpuErr : null;
++      const b = cpuErr instanceof StillCutoutError ? cpuErr : null;
++      if (b?.reason === 'no_subject' || a?.reason === 'no_subject') throw new StillCutoutError('no_subject');
++      throw b ?? a ?? new StillCutoutError('segment_failed', String(cpuErr));
++    }
++  }
++}
++
+ export interface GenerateMatteOptions {
+   videoSrc:   string;
+   fps:        number;
+@@ -226,8 +398,7 @@ export async function generateSubjectMatte(opts: GenerateMatteOptions): Promise<
+ 
+   const frame = new OffscreenCanvas(outW, outH);
+   const fctx = frame.getContext('2d', { alpha: true }) as OffscreenCanvasRenderingContext2D;
+-  let maskCanvas: OffscreenCanvas | null = null;
+-  let mctx: OffscreenCanvasRenderingContext2D | null = null;
++  const scratch = newMaskScratch();
+ 
+   const frameDurMs = 1000 / fps;
+   const lastEnd = windows.length ? windows[windows.length - 1].endMs : 0;
+@@ -251,33 +422,10 @@ export async function generateSubjectMatte(opts: GenerateMatteOptions): Promise<
+     segTs += Math.max(1, Math.round(frameDurMs));
+     let result: import('@mediapipe/tasks-vision').ImageSegmenterResult | undefined;
+     try { result = segmenter?.segmentForVideo(video, segTs); } catch { result = undefined; }
+-    try {
+-      const masks = result?.confidenceMasks;
+-      if (masks && masks.length) {
+-        const bg = masks[0]; const mw = bg.width, mh = bg.height;
+-        const data = bg.getAsFloat32Array(); const multiclass = masks.length > 1;
+-        if (!maskCanvas || maskCanvas.width !== mw || maskCanvas.height !== mh) {
+-          maskCanvas = new OffscreenCanvas(mw, mh);
+-          mctx = maskCanvas.getContext('2d', { alpha: true }) as OffscreenCanvasRenderingContext2D;
+-        }
+-        const img = mctx!.createImageData(mw, mh);
+-        for (let i = 0; i < data.length; i++) {
+-          let a = multiclass ? 1 - data[i] : data[i];
+-          a = a <= 0.30 ? 0 : a >= 0.70 ? 1 : (a - 0.30) / 0.40;
+-          const o = i * 4;
+-          img.data[o] = 255; img.data[o + 1] = 255; img.data[o + 2] = 255; img.data[o + 3] = Math.round(a * 255);
+-        }
+-        mctx!.putImageData(img, 0, 0);
+-        fctx.save();
+-        fctx.globalCompositeOperation = 'destination-in';
+-        fctx.imageSmoothingEnabled = true;
+-        fctx.drawImage(maskCanvas, 0, 0, outW, outH);
+-        fctx.restore();
+-      } else {
+-        // No mask → no subject this frame; drop the drawn video so we never bake an opaque frame.
+-        fctx.clearRect(0, 0, outW, outH);
+-      }
+-    } finally { result?.close?.(); }
++    // No mask → no subject this frame; applyConfidenceMask clears the drawn video so we never bake
++    // an opaque frame.
++    try { applyConfidenceMask(fctx, result?.confidenceMasks, outW, outH, scratch); }
++    finally { result?.close?.(); }
+   };
+ 
+   // Yield a frame back to the browser so the editor's playback/overlay RAF and paints can run
+diff --git a/src/lib/projectStore.ts b/src/lib/projectStore.ts
+index c3faaa0..e118f63 100644
+--- a/src/lib/projectStore.ts
++++ b/src/lib/projectStore.ts
+@@ -16,6 +16,7 @@ import type {
+ } from '@/types/transcript';
+ import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
+ import type { BleepRange } from '@/lib/profanity';
++import type { CoverSettings } from '@/lib/cover/coverLayout';
+ 
+ // Everything needed to rehydrate the editor for a transcribed project.
+ export interface ProjectSnapshot {
+@@ -68,6 +69,9 @@ export interface ProjectSnapshot {
+   lineOverrides?:       Record<string, LineOverride>;
+   /** Global per-template slot overrides (editor_masala/illusion/aura). */
+   templateSlots?:       TemplateSlotOverrides;
++  /** Cover / thumbnail settings (optional — older snapshots won't have it). Settings ONLY: the
++      frame and cut-out are re-captured from the video, never stored (autosave rewrites the record). */
++  cover?:               CoverSettings;
+ }
+ 
+ /** Lift legacy per-segment style/box overrides into the unified lineOverrides map.
+diff --git a/src/remotion/CoverComposition.tsx b/src/remotion/CoverComposition.tsx
+new file mode 100644
+index 0000000..ede0ebf
+--- /dev/null
++++ b/src/remotion/CoverComposition.tsx
+@@ -0,0 +1,54 @@
++'use client';
++
++// Remotion wrapper for the cover still: mounts the SAME CoverStage the editor previews, and holds the
++// capture until (a) every caption face is actually decoded and (b) any image layer has loaded and
++// decoded. document.fonts.ready alone resolves while a never-used face is still unloaded, so each
++// family is force-loaded first — the same gate the video export compositions use.
++//
++// The download renders this with `transparent` and no image layers (coverExport composites the frame
++// and cut-out itself); the image gate still protects any caller that passes them.
++
++import { useCallback, useEffect, useState } from 'react';
++import { AbsoluteFill, cancelRender, continueRender, delayRender } from 'remotion';
++import CoverStage, { type CoverStageProps } from '@/components/editor/cover/CoverStage';
++import { buildFontsCss, buildIndicFontsCss } from './KineticCaptionComposition';
++import { fontFamiliesFromCss } from '@/lib/fontFamilies';
++
++export type CoverCompositionProps = Omit<CoverStageProps, 'onReady'>;
++
++export function CoverComposition(props: CoverCompositionProps) {
++  const [handle] = useState(() => delayRender('Cover: fonts + images'));
++  const [fontsReady, setFontsReady] = useState(false);
++  const [imagesReady, setImagesReady] = useState(false);
++
++  useEffect(() => {
++    let alive = true;
++    const done = () => { if (alive) setFontsReady(true); };
++    if (typeof document === 'undefined' || !document.fonts) { done(); return; }
++    const families = fontFamiliesFromCss(buildFontsCss() + buildIndicFontsCss(props.text));
++    Promise.all(families.flatMap(f => [
++      document.fonts.load(`64px "${f}"`).catch(() => {}),
++      document.fonts.load(`italic 64px "${f}"`).catch(() => {}),
++    ]))
++      .then(() => document.fonts.ready)
++      .then(done, done);
++    return () => { alive = false; };
++  }, [props.text]);
++
++  useEffect(() => {
++    if (fontsReady && imagesReady) continueRender(handle);
++  }, [fontsReady, imagesReady, handle]);
++
++  // A layer without pixels must FAIL the render (the caller retries / shows an error) — never export a
++  // cover missing its frame or cut-out.
++  const onReady = useCallback((ok: boolean) => {
++    if (ok) setImagesReady(true);
++    else cancelRender(new Error('cover-image-not-loaded'));
++  }, []);
++
++  return (
++    <AbsoluteFill style={{ backgroundColor: props.transparent ? 'transparent' : '#000' }}>
++      <CoverStage {...props} onReady={onReady} />
++    </AbsoluteFill>
++  );
++}

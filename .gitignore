@@ -4,3 +4,7 @@ data/
 *.log
 training/weights.json
 dist/
+captik-graphics/public/broll/
+captik-graphics/.broll-tmp/
+.env.local
+captik-graphics/.env.local

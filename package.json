@@ -11,7 +11,8 @@
     "build:editor": "npm run build",
     "sync:captik": "node scripts/sync-captik.mjs",
     "build": "vite build --config web/vite.config.mjs",
-    "dev:web": "vite --config web/vite.config.mjs"
+    "dev:web": "vite --config web/vite.config.mjs",
+    "graphics:smoke": "node scripts/graphics-smoke.mjs"
   },
   "license": "ISC",
   "type": "module",
@@ -20,7 +21,10 @@
     "@remotion/bundler": "4.0.470",
     "@remotion/media": "4.0.470",
     "@remotion/media-parser": "4.0.470",
+    "@remotion/noise": "4.0.470",
+    "@remotion/paths": "4.0.470",
     "@remotion/renderer": "4.0.470",
+    "@remotion/shapes": "4.0.470",
     "@remotion/web-renderer": "4.0.470",
     "express": "^5.2.1",
     "framer-motion": "12.39.0",

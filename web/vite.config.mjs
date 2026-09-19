@@ -2,25 +2,18 @@ import path from 'node:path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
-import { CAPTIK_DIR, CAPTIK_SRC, SHIMS } from '../captik/paths.mjs';
+import { CAPTIK_DIR, GRAPHICS_DIR } from '../captik/paths.mjs';
+import { captikResolve } from '../captik/vite-plugin.mjs';
 
-const posix = (p) => p.split(path.sep).join('/');
-const exact = (spec) => new RegExp(`^${spec.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`);
-
-// Two pages, both built from Captik's own components (vendored unchanged in captik/src, so `@/…` resolves exactly
-// as it does inside captik-app): the clipper home at / (Captik's dashboard) and the clip studio at /editor/.
+// Two pages, both built from Captik's own components (vendored unchanged in captik/src and captik-graphics/src):
+// the clipper home at / (Captik's dashboard) and the clip studio at /editor/. captikResolve() maps each tree's
+// `@/…` imports to that tree, so production-master code and the premium graphics system can be imported together.
 export default defineConfig({
   root: import.meta.dirname,
   base: '/',
-  plugins: [react(), tailwindcss()],
-  resolve: {
-    alias: [
-      ...Object.entries(SHIMS).map(([spec, file]) => ({ find: exact(spec), replacement: posix(file) })),
-      { find: /^@\//, replacement: `${posix(CAPTIK_SRC)}/` },
-    ],
-    dedupe: ['react', 'react-dom'],
-  },
-  server: { fs: { allow: [path.join(import.meta.dirname, '..'), CAPTIK_DIR] } },
+  plugins: [captikResolve(), react(), tailwindcss()],
+  resolve: { dedupe: ['react', 'react-dom'] },
+  server: { fs: { allow: [path.join(import.meta.dirname, '..'), CAPTIK_DIR, GRAPHICS_DIR] } },
   // Fonts are served by Express from captik/public/fonts at /fonts, the URL Captik's stylesheet uses.
   publicDir: false,
   build: {

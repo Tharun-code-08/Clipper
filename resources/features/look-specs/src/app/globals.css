@@ -1,0 +1,264 @@
+﻿@import "tailwindcss";
+
+/* ── Global reset / smooth scroll ────────────────────────────────────────── */
+html { scroll-behavior: smooth; }
+
+/* ── Self-hosted fonts ───────────────────────────────────────────────────────
+   woff2 first (browser picks the first format it supports — all modern browsers
+   use woff2). ttf/otf fallback for anything ancient. font-display:swap so text
+   paints instantly with a system fallback instead of staying invisible (FOIT). */
+@font-face { font-family: "Anton";            src: url("/fonts/Anton-Regular.woff2")          format("woff2"), url("/fonts/Anton-Regular.ttf")          format("truetype"); font-display: swap; }
+@font-face { font-family: "ClashDisplay";     src: url("/fonts/ClashDisplay-Bold.woff2")      format("woff2"), url("/fonts/ClashDisplay-Bold.ttf")      format("truetype"); font-display: swap; }
+@font-face { font-family: "DrukWide";         src: url("/fonts/DrukWideBold.woff2")           format("woff2"), url("/fonts/DrukWideBold.ttf")           format("truetype"); font-display: swap; }
+@font-face { font-family: "Futura";           src: url("/fonts/Futura-Bold-font.woff2")       format("woff2"), url("/fonts/Futura-Bold-font.ttf")       format("truetype"); font-weight: 700; font-display: swap; }
+@font-face { font-family: "Futura";           src: url("/fonts/Futura-Heavy-font.woff2")      format("woff2"), url("/fonts/Futura-Heavy-font.ttf")      format("truetype"); font-weight: 900; font-display: swap; }
+@font-face { font-family: "LuckiestGuy";      src: url("/fonts/LuckiestGuy-Regular.woff2")    format("woff2"), url("/fonts/LuckiestGuy-Regular.ttf")    format("truetype"); font-display: swap; }
+@font-face { font-family: "Luckiest Guy";     src: url("/fonts/LuckiestGuy-Regular.woff2")    format("woff2"), url("/fonts/LuckiestGuy-Regular.ttf")    format("truetype"); font-display: swap; }
+@font-face { font-family: "Montserrat";       src: url("/fonts/Montserrat-VariableFont_wght.woff2") format("woff2"), url("/fonts/Montserrat-VariableFont_wght.ttf") format("truetype"); font-weight: 100 900; font-display: swap; }
+@font-face { font-family: "Montserrat Light"; src: url("/fonts/Montserrat-VariableFont_wght.woff2") format("woff2"), url("/fonts/Montserrat-VariableFont_wght.ttf") format("truetype"); font-weight: 300; font-display: swap; }
+@font-face { font-family: "MontserratSemiBold";    src: url("/fonts/Montserrat-VariableFont_wght.woff2") format("woff2"), url("/fonts/Montserrat-VariableFont_wght.ttf") format("truetype"); font-weight: 600; font-display: swap; }
+@font-face { font-family: "Poppins";          src: url("/fonts/Poppins-Medium.woff2")         format("woff2"), url("/fonts/Poppins-Medium.ttf")         format("truetype"); font-display: swap; }
+@font-face { font-family: "TimesNewRomanBold"; src: url("/fonts/Times-New-Roman-Bold.woff2")  format("woff2"), url("/fonts/Times-New-Roman-Bold.ttf")  format("truetype"); font-display: swap; }
+@font-face { font-family: "Times New Roman";  src: url("/fonts/Times-New-Roman-Bold.woff2")  format("woff2"), url("/fonts/Times-New-Roman-Bold.ttf")  format("truetype"); font-display: swap; }
+@font-face { font-family: "VPPixel";          src: url("/fonts/VPPixel-Simplified.woff2")     format("woff2"), url("/fonts/VPPixel-Simplified.otf")     format("opentype"); font-display: swap; }
+@font-face { font-family: "MonaSans";         src: url("/fonts/MonaSans.woff2")               format("woff2"), url("/fonts/MonaSans.ttf")               format("truetype"); font-weight: 400; font-display: swap; }
+@font-face { font-family: "MonaSans";         src: url("/fonts/Mona-Sans-Bold.woff2")         format("woff2"), url("/fonts/Mona-Sans-Bold.ttf")         format("truetype"); font-weight: 700; font-display: swap; }
+@font-face { font-family: "TheBoldFont";      src: url("/fonts/TheBoldFont.woff2")            format("woff2"), url("/fonts/TheBoldFont.ttf")            format("truetype"); font-display: swap; }
+@font-face { font-family: "KomikaAxis";       src: url("/fonts/KomikaAxis.woff2")             format("woff2"), url("/fonts/KomikaAxis.ttf")             format("truetype"); font-display: swap; }
+@font-face { font-family: "Inter";            src: url("/fonts/Inter.woff2")                  format("woff2"), url("/fonts/Inter.ttf")                  format("truetype"); font-display: swap; }
+@font-face { font-family: "HelveticaBold";    src: url("/fonts/Inter-Black.ttf")             format("truetype"); font-weight: 100 900; font-display: swap; }
+@font-face { font-family: "RubikBlack";       src: url("/fonts/RubikBlack.woff2")             format("woff2"), url("/fonts/RubikBlack.ttf")             format("truetype"); font-display: swap; }
+/* Abril Fatface (OFL-1.1, TypeTogether; licence in public/fonts/AbrilFatface-OFL.txt). Declared under
+   an alias because "Abril Fatface" is a Reserved Font Name and the web files are subsets. */
+@font-face { font-family: "AbrilFatface";     src: url("/fonts/AbrilFatface-Latin.woff2")     format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "AbrilFatface";     src: url("/fonts/AbrilFatface-LatinExt.woff2")  format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+/* Faces for the behind-the-speaker looks, bundled from @fontsource as latin + latin-ext woff2 subsets,
+   licences beside them in public/fonts (OFL-1.1; Special Elite Apache-2.0). Declared under no-space
+   names, as Abril Fatface is: Press Start 2P is a Reserved Font Name and these files are subsets.
+   PoppinsBold is its own family so the Poppins every other template uses is unchanged. */
+@font-face { font-family: "RubikSprayPaint"; src: url("/fonts/RubikSprayPaint-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "RubikSprayPaint"; src: url("/fonts/RubikSprayPaint-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "Gloock"; src: url("/fonts/Gloock-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "Gloock"; src: url("/fonts/Gloock-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "InstrumentSerif"; src: url("/fonts/InstrumentSerif-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "InstrumentSerif"; src: url("/fonts/InstrumentSerif-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "PressStart2P"; src: url("/fonts/PressStart2P-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "PressStart2P"; src: url("/fonts/PressStart2P-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "BagelFatOne"; src: url("/fonts/BagelFatOne-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "BagelFatOne"; src: url("/fonts/BagelFatOne-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "Baloo2"; src: url("/fonts/Baloo2-ExtraBold-Latin.woff2") format("woff2"); font-weight: 800; font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "Baloo2"; src: url("/fonts/Baloo2-ExtraBold-LatinExt.woff2") format("woff2"); font-weight: 800; font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "ArchivoBlack"; src: url("/fonts/ArchivoBlack-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "ArchivoBlack"; src: url("/fonts/ArchivoBlack-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "Roboto"; src: url("/fonts/Roboto-Latin.woff2") format("woff2"); font-weight: 700; font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "Roboto"; src: url("/fonts/Roboto-LatinExt.woff2") format("woff2"); font-weight: 700; font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "AlexBrush"; src: url("/fonts/AlexBrush-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "AlexBrush"; src: url("/fonts/AlexBrush-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "Unna"; src: url("/fonts/Unna-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "Unna"; src: url("/fonts/Unna-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "SpecialElite"; src: url("/fonts/SpecialElite-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "SpecialElite"; src: url("/fonts/SpecialElite-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "PoppinsBold"; src: url("/fonts/PoppinsBold-Latin.woff2") format("woff2"); font-weight: 700; font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "PoppinsBold"; src: url("/fonts/PoppinsBold-LatinExt.woff2") format("woff2"); font-weight: 700; font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "GloriaHallelujah"; src: url("/fonts/GloriaHallelujah-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "GloriaHallelujah"; src: url("/fonts/GloriaHallelujah-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "BebasNeue"; src: url("/fonts/BebasNeue-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "BebasNeue"; src: url("/fonts/BebasNeue-LatinExt.woff2") format("woff2"); font-display: swap; unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family: "BlackHanSans"; src: url("/fonts/BlackHanSans-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "FredokaOne"; src: url("/fonts/FredokaOne-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+2074,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "BBHBartle"; src: url("/fonts/BBHBartle-Latin.woff2") format("woff2"); font-display: swap; unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD; }
+@font-face { font-family: "InstrumentSans";   src: url("/fonts/InstrumentSans-SemiBold.woff2") format("woff2"), url("/fonts/InstrumentSans-SemiBold.ttf") format("truetype"); font-display: swap; }
+@font-face { font-family: "LobsterTwoItalic"; src: url("/fonts/LobsterTwo-Italic.woff2")      format("woff2"), url("/fonts/LobsterTwo-Italic.ttf")      format("truetype"); font-display: swap; }
+@font-face { font-family: "InstrumentSerifItalic"; src: url("/fonts/InstrumentSerif-Italic.woff2") format("woff2"), url("/fonts/InstrumentSerif-Italic.ttf") format("truetype"); font-style: italic; font-display: swap; }
+@font-face { font-family: "Open Sans";        src: url("/fonts/OpenSans-Variable.ttf") format("truetype"); font-weight: 300 800; font-display: swap; }
+@font-face { font-family: "Playfair Display"; src: url("/fonts/PlayfairDisplay-Italic.ttf") format("truetype"); font-style: italic; font-weight: 400 900; font-display: swap; }
+@font-face { font-family: "Caveat";           src: url("/fonts/Caveat-Variable.ttf")          format("truetype"); font-weight: 400 700; font-display: swap; }
+@font-face { font-family: "KaushanScript";    src: url("/fonts/KaushanScript-Regular.ttf")    format("truetype"); font-display: swap; }
+/* Blockbuster's tier-2 roundhand. This file is what the EDITOR UI and the template thumbnails
+   resolve against — buildFontsCss() only covers the export. Without it here the preview fell
+   back silently: to Script MT Bold on Windows (which happens to be a roundhand, so it looked
+   plausible) and to generic cursive everywhere else, while Lambda rendered the real face. */
+@font-face { font-family: "GreatVibes";       src: url("/fonts/GreatVibes-Regular.ttf")       format("truetype"); font-display: swap; }
+@font-face { font-family: "BradleyHand";      src: url("/fonts/BradleyHandITC.woff2") format("woff2"), url("/fonts/BradleyHandITC.ttf") format("truetype"); font-display: swap; }
+
+@theme inline {
+  --color-background: #0B0B0D;
+  --color-foreground: #ffffff;
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  /* Brand tokens */
+  --color-primary:      #f59e0b;
+  --color-accent:       #f59e0b;
+  --color-accent-light: #fbbf24;
+  --color-surface:      #111109;
+  --color-card:         #1a190f;
+}
+
+html, body {
+  height: 100%;
+  background: #0B0B0D;
+  color: #ffffff;
+}
+
+/* ── Animations ──────────────────────────────────────────────────────────── */
+@keyframes textFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes text-focus-in {
+  0%   { filter: blur(12px); opacity: 0; }
+  100% { filter: blur(0px);  opacity: 1; }
+}
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+@keyframes float {
+  0%, 100% { transform: translateY(0px);   }
+  50%       { transform: translateY(-8px);  }
+}
+@keyframes float-slow {
+  0%, 100% { transform: translateY(0px);   }
+  50%       { transform: translateY(-4px);  }
+}
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+@keyframes gradient-shift {
+  0%   { background-position: 0%   50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0%   50%; }
+}
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245,158,11,0); }
+  50%       { box-shadow: 0 0 24px 4px rgba(245,158,11,0.35); }
+}
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+/* Indeterminate ProgressBar sweep (src/components/ui/ProgressBar.tsx) */
+@keyframes captik-indeterminate {
+  0%   { left: -33%; }
+  100% { left: 100%; }
+}
+/* Captik logo mark — comes alive on hover (amber shimmer + lift). Triggers on the
+   mark itself OR any ancestor with Tailwind's `group` class, so hovering the full
+   "Captik" lockup animates it. Classes set in src/components/Logo.tsx LogoMark. */
+@keyframes captik-logo-shimmer {
+  0%, 100% { filter: hue-rotate(0deg)   brightness(1)    saturate(1);    }
+  50%      { filter: hue-rotate(-26deg) brightness(1.22) saturate(1.3);  }
+}
+.captik-logo-mark { transition: transform .25s ease, box-shadow .25s ease; }
+.captik-logo-mark:hover,
+.group:hover .captik-logo-mark {
+  transform: scale(1.09);
+  box-shadow: 0 6px 20px rgba(245, 158, 11, 0.45);
+}
+.captik-logo-mark:hover .captik-logo-glyph,
+.group:hover .captik-logo-mark .captik-logo-glyph {
+  animation: captik-logo-shimmer 1.05s ease-in-out infinite;
+  transform-origin: center;
+}
+
+.animate-shimmer      { animation: shimmer 2.5s linear infinite; }
+.animate-float        { animation: float 4s ease-in-out infinite; }
+.animate-float-slow   { animation: float-slow 6s ease-in-out infinite; }
+.animate-spin-slow    { animation: spin-slow 12s linear infinite; }
+.animate-marquee      { animation: marquee 28s linear infinite; }
+.animate-pulse-glow   { animation: pulse-glow 2s ease-in-out infinite; }
+.animate-slide-up     { animation: slide-up 0.5s ease forwards; }
+.animate-gradient     {
+  background-size: 200% 200%;
+  animation: gradient-shift 4s ease infinite;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar        { width: 4px; height: 4px; }
+::-webkit-scrollbar-track  { background: #18181b; }
+::-webkit-scrollbar-thumb  { background: #3f3f46; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #52525b; }
+
+/* Focus ring */
+:focus-visible {
+  outline: 2px solid #f59e0b;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Range input */
+input[type='range'] { cursor: pointer; accent-color: #f59e0b; }
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: #f59e0b;
+  border: 2px solid #0B0B0D;
+  box-shadow: 0 0 0 1px #f59e0b, 0 0 8px rgba(245,158,11,.4);
+}
+input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: #3f3f46;
+}
+
+/* Respect reduced-motion: freeze the landing marquees instead of scrolling them. */
+@media (prefers-reduced-motion: reduce) {
+  [style*="marquee"] { animation: none !important; }
+}
+
+/* ── Product tour (driver.js) — dark theme matching the editor ────────────── */
+.driver-popover.captik-tour {
+  background: #131318;
+  color: #e4e4e7;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 14px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+  /* Fit phone viewports — the mobile editor tour runs on screens down to ~360px. */
+  max-width: min(320px, calc(100vw - 24px));
+}
+.driver-popover.captik-tour .driver-popover-title {
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+}
+.driver-popover.captik-tour .driver-popover-description {
+  color: #a1a1aa;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.driver-popover.captik-tour .driver-popover-progress-text {
+  color: #71717a;
+  font-size: 11px;
+}
+.driver-popover.captik-tour button {
+  background: rgba(255, 255, 255, 0.06);
+  color: #e4e4e7;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  text-shadow: none;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.driver-popover.captik-tour button:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+.driver-popover.captik-tour .driver-popover-next-btn {
+  background: #f59e0b;
+  color: #000;
+  font-weight: 700;
+  border-color: transparent;
+}
+.driver-popover.captik-tour .driver-popover-next-btn:hover {
+  background: #fbbf24;
+}
+.driver-popover.captik-tour .driver-popover-arrow-side-left.driver-popover-arrow  { border-left-color: #131318; }
+.driver-popover.captik-tour .driver-popover-arrow-side-right.driver-popover-arrow { border-right-color: #131318; }
+.driver-popover.captik-tour .driver-popover-arrow-side-top.driver-popover-arrow   { border-top-color: #131318; }
+.driver-popover.captik-tour .driver-popover-arrow-side-bottom.driver-popover-arrow{ border-bottom-color: #131318; }

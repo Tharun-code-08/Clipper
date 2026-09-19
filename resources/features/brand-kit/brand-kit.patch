@@ -1,0 +1,2768 @@
+ src/app/editor/page.tsx                       | 134 +++++++++++++++++-
+ src/components/editor/RightPanel.tsx          |   4 +
+ src/components/editor/VideoCanvas.tsx         |  12 +-
+ src/components/editor/panel/BrandKitPanel.tsx | 451 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/components/editor/panel/TemplatesTab.tsx  |  19 ++-
+ src/lib/__tests__/brandKit.spec.ts            | 370 +++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib/__tests__/brandKitStore.spec.ts       |  89 ++++++++++++
+ src/lib/__tests__/brandLogoSurfaces.spec.ts   |  65 +++++++++
+ src/lib/brandKit.ts                           | 798 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/lib/brandKitStore.ts                      |  59 ++++++++
+ src/lib/brandLogo.ts                          | 103 ++++++++++++++
+ src/lib/export/elementCaptureExport.tsx       |  14 +-
+ src/lib/presetStore.ts                        |   4 +-
+ src/lib/projectStore.ts                       |   5 +
+ src/remotion/BrandLogoOverlay.tsx             |  76 +++++++++++
+ src/remotion/CaptionExportComposition.tsx     |  16 ++-
+ src/remotion/LambdaCaptionComposition.tsx     |  32 ++++-
+ src/remotion/useBrandLogoGate.ts              |  19 +++
+ 18 files changed, 2254 insertions(+), 16 deletions(-)
+
+diff --git a/src/app/editor/page.tsx b/src/app/editor/page.tsx
+index 1e2f476..bec42b6 100644
+--- a/src/app/editor/page.tsx
++++ b/src/app/editor/page.tsx
+@@ -61,6 +61,12 @@ import { UploadError, uploadBackoffMs, type UploadAction } from '@/lib/uploadErr
+ import { RenderStartError } from '@/lib/renderStart';
+ import { sanitizeRenderWords, safeDurationMs } from '@/lib/renderPayload';
+ import { CaptionExportComposition, type CaptionExportProps } from '@/remotion/CaptionExportComposition';
++import {
++  brandLogoFromKit, brandMapKey, emptyBrandLedger, mapBrandKit, normalizeAppliedBrandKit,
++  remapBrandKit, removeBrandKitFromLook, withoutBrandColors,
++  type AppliedBrandKit, type BrandKit, type BrandLook,
++} from '@/lib/brandKit';
++import { brandLogoBox, type BrandLogoProps } from '@/lib/brandLogo';
+ import type { CaptionBoxConfig, TextOverrides, EmphasisStyle, LayoutMode, LineOverride, TemplateSlotOverrides } from '@/types/transcript';
+ import { useIsMobile } from '@/hooks/useIsMobile';
+ import { type AspectRatio, aspectValue, exportDims, webExportBitrate, MIN_4K_SOURCE_LONG_EDGE } from '@/lib/aspect';
+@@ -181,10 +187,21 @@ async function recordVideoWithCaptions(
+   bitrate: number,
+   captionOpts: Omit<CanvasCaptionOptions, 'currentMs'>,
+   onProgress: (p: number) => void,
++  brandLogo?: BrandLogoProps | null,
+ ): Promise<Blob> {
+   // Pre-load fonts so canvas renders with the correct typeface.
+   await document.fonts.ready;
+ 
++  // Brand Kit logo — decoded once, then drawn on every frame at the SHARED geometry
++  // (brandLogoBox). This recorder paints straight onto a canvas, so it's the one surface that
++  // can't mount BrandLogoOverlay; the geometry helper keeps it on the same pixels regardless.
++  const logoImg = brandLogo ? await new Promise<HTMLImageElement | null>((resolve) => {
++    const im = new Image();
++    im.onload  = () => resolve(im);
++    im.onerror = () => resolve(null);   // a logo that won't decode must never fail the export
++    im.src = brandLogo.src;
++  }) : null;
++
+   const canvas = document.createElement('canvas');
+   canvas.width = w; canvas.height = h;
+   const ctx = canvas.getContext('2d')!;
+@@ -245,6 +262,13 @@ async function recordVideoWithCaptions(
+       ctx.globalCompositeOperation = 'source-over';
+       ctx.drawImage(origVideo, 0, 0, w, h);
+       drawCaptionsOnCanvas(ctx, w, h, { ...captionOpts, currentMs: origVideo.currentTime * 1000 });
++      if (logoImg && brandLogo) {
++        const box = brandLogoBox(w, h, brandLogo);
++        ctx.save();
++        ctx.globalAlpha = brandLogo.opacity;
++        ctx.drawImage(logoImg, box.x, box.y, box.width, box.height);
++        ctx.restore();
++      }
+       onProgress(Math.min(origVideo.currentTime / duration, 0.99));
+       requestAnimationFrame(frame);
+     };
+@@ -574,6 +598,9 @@ export default function EditorPage() {
+   // Per-template slot overrides (editor_masala/illusion/aura) — global; per-line slots
+   // live in lineOverrides.slots and are derived into lineSlotOverrides below.
+   const [templateSlots,  setTemplateSlots]  = useState<TemplateSlotOverrides>({});
++  // The Brand Kit applied to this project (kit + the ledger "Remove kit" restores from). The kit's
++  // colours and font are written into the state above; this drives the logo overlay and removal.
++  const [appliedBrandKit, setAppliedBrandKit] = useState<AppliedBrandKit | null>(null);
+ 
+   // Patch one line's override bundle; empty bundles are dropped so "has override"
+   // checks (chips, Remove Style) stay accurate. `patch` fields set to undefined clear.
+@@ -1184,6 +1211,7 @@ export default function EditorPage() {
+       setEmphasisStyle(s.emphasisStyle ?? {});
+       setLayoutMode(s.layoutMode ?? 'splash');
+       setTemplateSlots(s.templateSlots ?? {});
++      setAppliedBrandKit(normalizeAppliedBrandKit(s.brandKit));
+       // Salvage overrides orphaned by an older build that re-keyed segments without migrating:
+       // a key that is a non-head word of some saved segment moves back to that segment's head.
+       setLineOverrides(reanchorLineOverrideKeys(s.captionSegments ?? [], migrateSnapshotOverrides(s)));
+@@ -1731,6 +1759,7 @@ export default function EditorPage() {
+     captionGapMs, captionCustomFont, customFontIsCustom,
+     customFontData: customFontData ?? undefined,
+     textOverrides, emphasisStyle, layoutMode, lineOverrides, templateSlots,
++    brandKit: appliedBrandKit ?? undefined,
+   }), [
+     words, srtNative, transcript, durationMs, captionSegments, captionStyle,
+     dominantColor, accentColor, captionTextColor, captionYPercent,
+@@ -1738,7 +1767,7 @@ export default function EditorPage() {
+     captionEmphBox, emphFontScale,
+     segmentStyleOverrides, bleepRanges, captionGapMs, captionCustomFont,
+     customFontIsCustom, customFontData,
+-    textOverrides, emphasisStyle, layoutMode, lineOverrides, templateSlots,
++    textOverrides, emphasisStyle, layoutMode, lineOverrides, templateSlots, appliedBrandKit,
+   ]);
+ 
+   // Ask the browser to persist our storage so the captik IndexedDB (snapshots +
+@@ -1937,6 +1966,7 @@ export default function EditorPage() {
+     setTextOverrides({});
+     setEmphasisStyle({});
+     setTemplateSlots({});
++    setAppliedBrandKit(null);
+     setLayoutMode('splash');
+     setPendingBox(null);
+     setPendingFontScale(null);
+@@ -2928,6 +2958,9 @@ export default function EditorPage() {
+     setLayoutMode(pr.layoutMode ?? 'splash');
+     setTemplateSlots(pr.templateSlots ?? {});
+     if (pr.captionCustomFont) { setCaptionCustomFont(pr.captionCustomFont); setCustomFontData(null); setCustomFontIsCustom(false); }
++    // A preset replaces the whole look, so an applied Brand Kit re-maps over it (clearing mappedFor
++    // forces the re-map effect) — the kit stays applied until it is explicitly removed.
++    setAppliedBrandKit(a => (a ? { ...a, mappedFor: '' } : a));
+     capture('preset_applied', { preset_style: pr.styleId });
+   }, []);
+ 
+@@ -2942,6 +2975,81 @@ export default function EditorPage() {
+     setLayoutMode('splash');
+   }, []);
+ 
++  // ── Brand Kit ────────────────────────────────────────────────────────────────
++  // A kit is WRITTEN INTO the look state (colours, emphasis, slots, font) rather than layered over
++  // it, so the preview and every export path pick it up exactly like a manual edit — there is no
++  // second styling path to drift. `appliedBrandKit` holds the kit itself (so the project keeps its
++  // logo + font bytes even if the kit is deleted from the library) plus the ledger that lets
++  // "Remove kit" put the previous look back. All the rules live in src/lib/brandKit.ts.
++
++  const currentBrandLook = useCallback((): BrandLook => ({
++    captionTextColor, accentColor, emphasisStyle, templateSlots, textOverrides,
++    font: { name: captionCustomFont, data: customFontData, isCustom: customFontIsCustom },
++  }), [captionTextColor, accentColor, emphasisStyle, templateSlots, textOverrides,
++       captionCustomFont, customFontData, customFontIsCustom]);
++
++  const commitBrandLook = useCallback((next: BrandLook, prev: BrandLook) => {
++    if (next.captionTextColor !== prev.captionTextColor) setCaptionTextColor(next.captionTextColor);
++    if (next.accentColor      !== prev.accentColor)      setAccentColor(next.accentColor);
++    if (next.emphasisStyle    !== prev.emphasisStyle)    setEmphasisStyle(next.emphasisStyle);
++    if (next.templateSlots    !== prev.templateSlots)    setTemplateSlots(next.templateSlots);
++    if (next.textOverrides    !== prev.textOverrides)    setTextOverrides(next.textOverrides);
++    if (next.font !== prev.font) {
++      setCaptionCustomFont(next.font.name);
++      setCustomFontData(next.font.data);
++      setCustomFontIsCustom(next.font.isCustom);
++      // Re-register an uploaded face so the preview shows it without reopening the Fonts panel.
++      if (next.font.name && next.font.data) registerCustomFont(next.font.name, next.font.data);
++    }
++  }, []);
++
++  /** Per-caption template overrides in play — their slot colours are mapped alongside the project's. */
++  const brandLineStyleIds = useMemo(() => Object.values(segmentStyleOverrides), [segmentStyleOverrides]);
++
++  const handleApplyBrandKit = useCallback((kit: BrandKit) => {
++    const prev = currentBrandLook();
++    // Re-applying (or swapping kits) starts from the look WITHOUT the previous kit, so the ledger's
++    // "before" values stay the creator's own look rather than the old kit's colours.
++    const base = appliedBrandKit ? removeBrandKitFromLook(prev, appliedBrandKit.ledger) : prev;
++    const mapping = mapBrandKit(captionStyle, kit, brandLineStyleIds);
++    const { look, ledger } = remapBrandKit(base, emptyBrandLedger(), mapping.patch);
++    commitBrandLook(look, prev);
++    setAppliedBrandKit({
++      kit, ledger, mappedFor: brandMapKey(captionStyle, brandLineStyleIds),
++      notes: mapping.notes, appliedAt: Date.now(),
++    });
++  }, [appliedBrandKit, captionStyle, brandLineStyleIds, currentBrandLook, commitBrandLook]);
++
++  const handleRemoveBrandKit = useCallback(() => {
++    if (!appliedBrandKit) return;
++    const prev = currentBrandLook();
++    commitBrandLook(removeBrandKitFromLook(prev, appliedBrandKit.ledger), prev);
++    // The per-template colour memory must not carry kit colours back on the next template switch.
++    for (const [id, colors] of Object.entries(perTemplateColorsRef.current)) {
++      perTemplateColorsRef.current[id] = withoutBrandColors(colors, appliedBrandKit.ledger);
++    }
++    setAppliedBrandKit(null);
++  }, [appliedBrandKit, currentBrandLook, commitBrandLook]);
++
++  // Changing the template (or giving captions their own) re-maps the applied kit onto the new set,
++  // so a kit stays applied across template changes. The mappedFor guard makes this a no-op for
++  // every other state change.
++  useEffect(() => {
++    if (!appliedBrandKit) return;
++    const key = brandMapKey(captionStyle, brandLineStyleIds);
++    if (appliedBrandKit.mappedFor === key) return;
++    const prev = currentBrandLook();
++    const mapping = mapBrandKit(captionStyle, appliedBrandKit.kit, brandLineStyleIds);
++    const { look, ledger } = remapBrandKit(prev, appliedBrandKit.ledger, mapping.patch);
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- the template changed under an applied kit; the mappedFor guard above makes this run once per change, not per render
++    commitBrandLook(look, prev);
++    // eslint-disable-next-line react-hooks/set-state-in-effect -- same: one re-map per template change
++    setAppliedBrandKit({ ...appliedBrandKit, ledger, mappedFor: key, notes: mapping.notes });
++  }, [appliedBrandKit, captionStyle, brandLineStyleIds, currentBrandLook, commitBrandLook]);
++
++  /** The logo overlay prop — one value handed to the preview and every export path. */
++  const brandLogo = useMemo(() => brandLogoFromKit(appliedBrandKit?.kit), [appliedBrandKit]);
++
+   // ── Local save ───────────────────────────────────────────────────────────────
+   // Everything is persisted locally (IndexedDB + localStorage) — never Supabase.
+   // Autosave already flushes on every edit; this button just forces an immediate
+@@ -3154,6 +3262,7 @@ export default function EditorPage() {
+             lineTextOverrides,
+             templateSlots,
+             lineSlotOverrides,
++            brandLogo,
+           };
+           await exportViaElementCapture({
+             props:      ecProps,
+@@ -3240,6 +3349,7 @@ export default function EditorPage() {
+             lineTextOverrides,
+             templateSlots,
+             lineSlotOverrides,
++            brandLogo,
+           };
+           const wcStart = Date.now();
+           let flaggedSlow = false;
+@@ -3330,6 +3440,7 @@ export default function EditorPage() {
+             { words: activeWords, segments: captionSegments ?? [], style: captionStyle,
+               box: captionBox, segmentBoxOverrides, segmentFontScaleOverrides, accentColor, captionTextColor, fontScale: captionFontScale },
+             (p) => setRenderProgress(Math.round(p * 100)),
++            brandLogo,
+           );
+           if (!blob || blob.size === 0) return false;
+           const ext = blob.type.startsWith('video/mp4') ? 'mp4' : 'webm';
+@@ -3449,6 +3560,7 @@ export default function EditorPage() {
+               lineTextOverrides,
+               templateSlots,
+               lineSlotOverrides,
++              brandLogo,
+             };
+             // Slow-device watchdog: this in-browser render is single-threaded, so on a weak
+             // machine a long/heavy clip can grind for many minutes. Surface a non-blocking hint
+@@ -3551,6 +3663,7 @@ export default function EditorPage() {
+                 lineTextOverrides,
+                 templateSlots,
+                 lineSlotOverrides,
++                brandLogo,
+               };
+               await exportViaElementCapture({
+                 props:      ecProps,
+@@ -3758,7 +3871,8 @@ export default function EditorPage() {
+       // ── Fast path (Railway ffmpeg + libass) — supported styles + libass-safe font ──
+       // liquid_glass needs a real backdrop-filter blur (its glass container), which libass
+       // can't draw — force it to Lambda (headless Chrome) so the export matches the preview.
+-      if (railwayFastEnabled && isFastStyle(captionStyle) && fontFastSafe && !hasPerSegmentStyle && tovFastSafe && captionStyle !== 'liquid_glass' && !needsBehindSubjectExport && !isIndic) {
++      // (A Brand Kit logo also forces the full renderer — libass can't composite an image.)
++      if (railwayFastEnabled && isFastStyle(captionStyle) && fontFastSafe && !hasPerSegmentStyle && tovFastSafe && captionStyle !== 'liquid_glass' && !needsBehindSubjectExport && !isIndic && !brandLogo) {
+         setRenderProgress(40);
+         // The burn preserves the source resolution unless told otherwise. Request a
+         // downscale only when the source is bigger than the chosen resolution AND the
+@@ -3838,6 +3952,11 @@ export default function EditorPage() {
+         captionLines, captionGapMs,
+         textOverrides, emphasisStyle, layoutMode, lineTextOverrides,
+         templateSlots, lineSlotOverrides,
++        // Brand Kit logo. NOTE: cloud renders only draw this once the Remotion site is redeployed
++        // from a build containing the prop (`npx remotion lambda sites create src/remotion/index.tsx
++        // --site-name=captik`) — the currently deployed bundle ignores the unknown key and exports
++        // exactly as before, minus the logo. See LambdaCaptionProps.brandLogo.
++        brandLogo,
+         // Custom font: name overrides every style's font; data URL embeds the binary
+         // so the headless-Chrome render can load it (built-in fonts are already bundled).
+         customFontName: captionCustomFont ?? undefined,
+@@ -4098,6 +4217,7 @@ export default function EditorPage() {
+         { words: activeWords, segments: captionSegments, style: captionStyle,
+           box: captionBox, segmentBoxOverrides, segmentFontScaleOverrides, accentColor, captionTextColor, fontScale: captionFontScale },
+         (p) => setRenderProgress(Math.round(p * 100)),
++        brandLogo,
+       );
+       const a   = document.createElement('a');
+       a.href    = URL.createObjectURL(finalBlob);
+@@ -4134,7 +4254,7 @@ export default function EditorPage() {
+       allowUnloadDuringRenderRef.current = false;
+       if (user) refreshCredits().catch(() => {});
+     }
+-  }, [videoURL, activeWords, rendering, resolution, aspectRatio, videoDims, isMobile, durationMs, dominantColor, accentColor, captionTextColor, bleepRanges, captionStyle, captionSegments, captionBox, segmentBoxOverrides, segmentFontScaleOverrides, captionEmphBox, segmentEmphBoxOverrides, emphFontScale, segmentEmphFontScaleOverrides, segmentStyleOverrides, captionFontScale, captionLines, captionCustomFont, customFontData, customFontIsCustom, projectName, user, credits, refreshCredits, preloadAllFonts, subjectMatte.matte]);
++  }, [videoURL, activeWords, rendering, resolution, aspectRatio, videoDims, isMobile, durationMs, dominantColor, accentColor, captionTextColor, bleepRanges, captionStyle, captionSegments, captionBox, segmentBoxOverrides, segmentFontScaleOverrides, captionEmphBox, segmentEmphBoxOverrides, emphFontScale, segmentEmphFontScaleOverrides, segmentStyleOverrides, captionFontScale, captionLines, captionCustomFont, customFontData, customFontIsCustom, projectName, user, credits, refreshCredits, preloadAllFonts, subjectMatte.matte, brandLogo]);
+ 
+   const handleDownloadSRT = useCallback(() => {
+     // Export from the SAME segments + word timings the preview uses, so the .srt matches
+@@ -4152,7 +4272,9 @@ export default function EditorPage() {
+     const next = s as CaptionStyleId;
+     if (next === captionStyle) return;
+     // Remember the colours of the template we're leaving…
+-    perTemplateColorsRef.current[captionStyle] = { accentColor, captionTextColor };
++    // Remember the colours the CREATOR chose, never the kit's: an applied kit is re-mapped onto the
++    // new template below, and a kit colour stored here would outlive "Remove kit".
++    perTemplateColorsRef.current[captionStyle] = withoutBrandColors({ accentColor, captionTextColor }, appliedBrandKit?.ledger);
+     // …and restore the target template's remembered colours, or fall back to its clean signature
+     // defaults (the resolveUserColors defaults, so each template shows its own look, not a mix).
+     const saved = perTemplateColorsRef.current[next];
+@@ -4164,7 +4286,7 @@ export default function EditorPage() {
+     // project restores wherever it was left.
+     if (next === 'big_red') setCaptionBox({ xPercent: 50, yPercent: 30, widthPercent: 84 });
+     setCaptionStyle(next);
+-  }, [captionStyle, accentColor, captionTextColor]);
++  }, [captionStyle, accentColor, captionTextColor, appliedBrandKit]);
+ 
+   // Templates-tab click, scoped like position/size: with captions SELECTED in the timeline the
+   // template applies to just those (per-line override — any of the templates, mid-video), and
+@@ -4394,6 +4516,7 @@ export default function EditorPage() {
+       mobile={isMobile}
+       videoDims={videoDims}
+       watermarked={!!user && !!credits && !(watermarkFree || projectClean)}
++      brandLogo={brandLogo}
+       textOverrides={textOverrides}
+       emphasisStyle={emphasisStyle}
+       layoutMode={layoutMode}
+@@ -4444,6 +4567,7 @@ export default function EditorPage() {
+       onApplyPreset={handleApplyPreset}
+       onRemoveStyleCustomizations={handleRemoveStyleCustomizations}
+       hasStyleCustomizations={hasStyleCustomizations}
++      brandKit={{ applied: appliedBrandKit, onApply: handleApplyBrandKit, onRemove: handleRemoveBrandKit }}
+     />
+   );
+ 
+diff --git a/src/components/editor/RightPanel.tsx b/src/components/editor/RightPanel.tsx
+index 4e792ba..9d5653d 100644
+--- a/src/components/editor/RightPanel.tsx
++++ b/src/components/editor/RightPanel.tsx
+@@ -10,6 +10,7 @@ import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
+ import type { TextOverrides, EmphasisStyle, LayoutMode, TemplateSlotOverrides } from '@/types/transcript';
+ import type { StylePreset } from '@/lib/presetStore';
+ import type { FontSelection } from './FontsPanel';
++import type { BrandKitControls } from './panel/BrandKitPanel';
+ import TextTab from './panel/TextTab';
+ import TemplatesTab from './panel/TemplatesTab';
+ import Tooltip from '@/components/ui/Tooltip';
+@@ -52,6 +53,8 @@ interface RightPanelProps {
+   onApplyPreset:            (p: StylePreset) => void;
+   onRemoveStyleCustomizations: () => void;
+   hasStyleCustomizations:   boolean;
++  /** Brand Kit section of the Templates tab (colours + font + logo applied in one click). */
++  brandKit?:                BrandKitControls;
+   mobile?:                  boolean;
+ }
+ 
+@@ -130,6 +133,7 @@ export default function RightPanel(p: RightPanelProps) {
+             onApplyPreset={p.onApplyPreset}
+             onRemoveStyleCustomizations={p.onRemoveStyleCustomizations}
+             hasStyleCustomizations={p.hasStyleCustomizations}
++            brandKit={p.brandKit}
+           />
+         )}
+       </div>
+diff --git a/src/components/editor/VideoCanvas.tsx b/src/components/editor/VideoCanvas.tsx
+index 9563f34..9fb5e13 100644
+--- a/src/components/editor/VideoCanvas.tsx
++++ b/src/components/editor/VideoCanvas.tsx
+@@ -14,6 +14,8 @@ import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
+ import { CaptionOverlay } from './CaptionOverlay';
+ import { CaptionBoundingBox } from './CaptionBoundingBox';
+ import PreviewWatermark from './PreviewWatermark';
++import { BrandLogoOverlay } from '@/remotion/BrandLogoOverlay';
++import type { BrandLogoProps } from '@/lib/brandLogo';
+ import ProgressBar from '@/components/ui/ProgressBar';
+ import Tooltip from '@/components/ui/Tooltip';
+ import { customFontStack } from '@/lib/textParser';
+@@ -104,6 +106,8 @@ interface VideoCanvasProps {
+   videoDims?:                  { w: number; h: number } | null;
+   /** Free tier: show the animated Captik bug over the preview (matches the export). */
+   watermarked?:                boolean;
++  /** Brand Kit logo overlay (the applied kit's logo) — same component every exporter draws. */
++  brandLogo?:                  BrandLogoProps | null;
+   /** Reference-parity styling (Text tab) — passed straight to CaptionOverlay. */
+   textOverrides?:              TextOverrides;
+   emphasisStyle?:              EmphasisStyle;
+@@ -156,7 +160,7 @@ const VideoCanvas = forwardRef<VideoCanvasHandle, VideoCanvasProps>(function Vid
+     captionGapMs = 0,
+     onCaptionBoxChange, onCaptionBoxScope, onCaptionBoxCancel, onCaptionBoxOutside, onCaptionFontScaleChange,
+     onTimeUpdate, onPlayStateChange,
+-    aspectRatio, onAspectRatioChange, mobile, videoDims, watermarked,
++    aspectRatio, onAspectRatioChange, mobile, videoDims, watermarked, brandLogo,
+     textOverrides, emphasisStyle, layoutMode, lineTextOverrides,
+     templateSlots, lineSlotOverrides,
+     matte, behindSubject = false, behindSubjectCount = 0, onToggleBehindSubject,
+@@ -898,6 +902,12 @@ const VideoCanvas = forwardRef<VideoCanvasHandle, VideoCanvasProps>(function Vid
+               </div>
+             )}
+ 
++            {/* Brand Kit logo — the SAME component the exports draw, mounted just before the watermark
++                so the watermark always stays on top of it. */}
++            {videoSrc && brandLogo && phase !== 'idle' && (
++              <BrandLogoOverlay logo={brandLogo} frameWidth={canvasW} frameHeight={canvasH} />
++            )}
++
+             {/* Free-tier watermark bug — same lockup the export burns in */}
+             {videoSrc && watermarked && phase !== 'idle' && (
+               <PreviewWatermark canvasW={canvasW} canvasH={canvasH} />
+diff --git a/src/components/editor/panel/BrandKitPanel.tsx b/src/components/editor/panel/BrandKitPanel.tsx
+new file mode 100644
+index 0000000..184319c
+--- /dev/null
++++ b/src/components/editor/panel/BrandKitPanel.tsx
+@@ -0,0 +1,451 @@
++'use client';
++
++// Right panel → Templates → "Brand Kit". A creator keeps their identity here — up to four colours, a
++// font and a logo — and applies it to the open project in one click. Kits are local (IndexedDB, see
++// brandKitStore.ts) and shared across projects; HOW a kit lands on a template lives in lib/brandKit.ts.
++
++import { useEffect, useRef, useState } from 'react';
++import { Check, Pencil, Plus, Trash2, Upload } from 'lucide-react';
++import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
++import { CAPTION_STYLES } from '@/lib/captionStyles';
++import {
++  BRAND_COLOR_ROLES, BRAND_COLOR_ROLE_LABELS, TEMPLATE_FIXED_COLOUR_NOTES,
++  brandLogoMime, createBrandKit, normalizeHex, rolesUsedByTemplate, svgIntrinsicSize, validateBrandLogoFile,
++  type AppliedBrandKit, type BrandColorRole, type BrandKit, type BrandKitNote,
++} from '@/lib/brandKit';
++import {
++  BRAND_LOGO_OPACITY, BRAND_LOGO_POSITIONS, BRAND_LOGO_SIZE, sanitizeBrandLogo, type BrandLogoPosition,
++} from '@/lib/brandLogo';
++import { BrandLogoOverlay } from '@/remotion/BrandLogoOverlay';
++import { deleteBrandKit, listBrandKits, saveBrandKit } from '@/lib/brandKitStore';
++import FontsPanel from '../FontsPanel';
++import { ColorField, ResetBtn, SliderRow } from './controls';
++import Tooltip from '@/components/ui/Tooltip';
++
++/** What the editor page hands down: the applied kit plus the two actions on the project. */
++export interface BrandKitControls {
++  applied: AppliedBrandKit | null;
++  onApply: (kit: BrandKit) => void;
++  onRemove: () => void;
++}
++
++export interface BrandKitPanelProps extends BrandKitControls {
++  captionStyle: CaptionStyleId;
++}
++
++const POSITION_LABELS: Record<BrandLogoPosition, string> = {
++  'top-left': 'Top left', 'top-right': 'Top right', 'bottom-left': 'Bottom left', 'bottom-right': 'Bottom right',
++};
++
++function noteText(note: BrandKitNote, templateName: string): string {
++  switch (note.kind) {
++    case 'font-locked':    return `${templateName} is drawn in its own typeface, so the kit font isn't applied here.`;
++    case 'fixed-colours':  return note.text;
++    case 'legibility':     return `Kept ${templateName}'s own ${note.label.toLowerCase()} colour so the caption stays readable.`;
++  }
++}
++
++/** Register an uploaded face so kit cards (and the preview) can show it by name. */
++function registerKitFont(kit: BrandKit) {
++  const f = kit.font;
++  if (!f?.data || typeof document === 'undefined' || typeof FontFace === 'undefined') return;
++  if ([...document.fonts].some(ff => ff.family === f.name && ff.status === 'loaded')) return;
++  try {
++    const face = new FontFace(f.name, f.data.slice().buffer as ArrayBuffer);
++    face.load().then(loaded => document.fonts.add(loaded)).catch(() => {});
++  } catch { /* non-fatal — the card just shows a fallback face */ }
++}
++
++const readDataUrl = (file: Blob) => new Promise<string>((resolve, reject) => {
++  const fr = new FileReader();
++  fr.onload = () => resolve(String(fr.result ?? ''));
++  fr.onerror = () => reject(new Error('Could not read that file.'));
++  fr.readAsDataURL(file);
++});
++
++const loadImage = (src: string) => new Promise<HTMLImageElement>((resolve, reject) => {
++  const img = new Image();
++  img.onload = () => resolve(img);
++  img.onerror = () => reject(new Error('That image could not be decoded.'));
++  img.src = src;
++});
++
++/**
++ * Turn an uploaded file into what a kit stores: an inline data URL plus its aspect ratio.
++ *
++ * SVG is converted to PNG. The in-browser exporter rasterises an <img> through its own
++ * html-in-canvas path, and vector sources are exactly where that differs from the browser's
++ * compositor — a PNG is drawn identically by the preview, Lambda's Chromium and the web renderer.
++ * The SVG's intrinsic size is read from its own markup (Chrome reports a placeholder size for an
++ * SVG with only a viewBox), so the rasterised logo keeps its true proportions.
++ */
++async function prepareLogo(file: File): Promise<{ dataUrl: string; aspect: number }> {
++  const mime = brandLogoMime(file) ?? 'image/png';
++  const raw = await readDataUrl(file);
++  const isSvg = mime === 'image/svg+xml';
++  let src = raw.startsWith(`data:${mime}`) ? raw : raw.replace(/^data:[^;,]*/, `data:${mime}`);
++
++  if (!isSvg) {
++    const img = await loadImage(src);
++    if (!img.naturalWidth || !img.naturalHeight) throw new Error('That image could not be decoded.');
++    return { dataUrl: src, aspect: img.naturalWidth / img.naturalHeight };
++  }
++
++  const text = await file.text();
++  const size = svgIntrinsicSize(text) ?? { w: 1024, h: 1024 };
++  // Give the SVG explicit pixel dimensions so the canvas rasterises it at full size, not at the
++  // browser's 300x150 placeholder.
++  const sized = /\swidth\s*=/.test(text) && /\sheight\s*=/.test(text)
++    ? text
++    : text.replace(/<svg\b/i, `<svg width="${size.w}" height="${size.h}"`);
++  src = `data:image/svg+xml;base64,${btoa(String.fromCharCode(...new TextEncoder().encode(sized)))}`;
++  const img = await loadImage(src);
++
++  for (const longEdge of [1024, 512]) {
++    const scale = Math.min(1, longEdge / Math.max(size.w, size.h));
++    const cw = Math.max(1, Math.round(size.w * scale));
++    const ch = Math.max(1, Math.round(size.h * scale));
++    const canvas = document.createElement('canvas');
++    canvas.width = cw; canvas.height = ch;
++    const ctx = canvas.getContext('2d');
++    if (!ctx) break;
++    ctx.drawImage(img, 0, 0, cw, ch);
++    try {
++      const png = canvas.toDataURL('image/png');
++      if (sanitizeBrandLogo({ src: png, aspect: cw / ch })) return { dataUrl: png, aspect: cw / ch };
++    } catch { break; }   // a tainted canvas (exotic SVG) — fall back to the SVG itself
++  }
++  if (sanitizeBrandLogo({ src, aspect: size.w / size.h })) return { dataUrl: src, aspect: size.w / size.h };
++  throw new Error('That logo is too large to use — try a simpler or smaller file.');
++}
++
++export default function BrandKitPanel(p: BrandKitPanelProps) {
++  const [kits, setKits] = useState<BrandKit[]>([]);
++  const [draft, setDraft] = useState<BrandKit | null>(null);
++  const [error, setError] = useState('');
++
++  useEffect(() => {
++    let alive = true;
++    listBrandKits().then(list => {
++      if (!alive) return;
++      list.forEach(registerKitFont);
++      setKits(list);
++    });
++    return () => { alive = false; };
++  }, []);
++
++  const templateName = CAPTION_STYLES.find(s => s.id === p.captionStyle)?.name ?? p.captionStyle;
++  const uses = rolesUsedByTemplate(p.captionStyle);
++  const appliedNotes = p.applied?.notes ?? [];
++  const fixedNote = TEMPLATE_FIXED_COLOUR_NOTES[p.captionStyle];
++
++  const handleSave = async (kit: BrandKit) => {
++    const saved = await saveBrandKit(kit);
++    if (!saved) { setError('Couldn’t save the kit on this device — storage is full or blocked.'); return; }
++    registerKitFont(saved);
++    setKits(prev => [saved, ...prev.filter(k => k.id !== saved.id)]);
++    setDraft(null);
++    setError('');
++    // Editing the kit that's on the project keeps the project in step with it.
++    if (p.applied?.kit.id === saved.id) p.onApply(saved);
++  };
++
++  const handleDelete = async (kit: BrandKit) => {
++    await deleteBrandKit(kit.id);
++    setKits(prev => prev.filter(k => k.id !== kit.id));
++    // The project keeps its own copy of an applied kit, so deleting from the library leaves it alone.
++  };
++
++  if (draft) {
++    return <BrandKitEditor draft={draft} onChange={setDraft} onSave={handleSave} onCancel={() => { setDraft(null); setError(''); }} error={error} />;
++  }
++
++  return (
++    <div className="space-y-2">
++      {p.applied && (
++        <div className="rounded-xl border border-emerald-400/30 bg-emerald-400/[0.07] px-3 py-2.5 space-y-1.5" data-testid="brandkit-applied">
++          <div className="flex items-center justify-between gap-2">
++            <p className="text-[11px] font-semibold text-emerald-200 truncate">
++              <Check className="w-3 h-3 inline-block mr-1 -mt-0.5" />{p.applied.kit.name} applied
++            </p>
++            <Tooltip label="Put back the colours, font and logo this project had before the kit">
++              <button onClick={p.onRemove}
++                className="text-[10.5px] font-semibold text-zinc-300 hover:text-white underline underline-offset-2 cursor-pointer shrink-0">
++                Remove kit
++              </button>
++            </Tooltip>
++          </div>
++          <p className="text-[10px] text-zinc-400">
++            {uses.length
++              ? <>{templateName} uses {uses.map(r => BRAND_COLOR_ROLE_LABELS[r].toLowerCase()).join(' · ')}</>
++              : <>{templateName} keeps its own colours</>}
++          </p>
++          {appliedNotes.map((n, i) => (
++            <p key={i} className="text-[10.5px] text-zinc-400 leading-relaxed">{noteText(n, templateName)}</p>
++          ))}
++        </div>
++      )}
++
++      {!p.applied && fixedNote && (
++        <p className="text-[10.5px] text-zinc-500 leading-relaxed px-1 pt-1">{fixedNote}</p>
++      )}
++
++      <button
++        onClick={() => { setDraft(createBrandKit({ name: `Brand kit ${kits.length + 1}` })); setError(''); }}
++        className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-white/[0.14] text-[10.5px] font-semibold text-zinc-300 hover:text-white hover:border-white/[0.28] transition-colors cursor-pointer"
++      >
++        <Plus className="w-3 h-3" /> New brand kit
++      </button>
++
++      {error && <p className="text-[10.5px] text-red-300 px-1">{error}</p>}
++
++      {kits.length === 0 ? (
++        <div className="text-center py-8 px-4">
++          <p className="text-[12px] text-zinc-500 font-medium">No brand kits yet</p>
++          <p className="text-[10.5px] text-zinc-600 mt-1.5 leading-relaxed">
++            Save your colours, font and logo once — then apply them to any project in a click.
++          </p>
++        </div>
++      ) : kits.map(kit => {
++        const isApplied = p.applied?.kit.id === kit.id;
++        const logo = kit.logo && sanitizeBrandLogo({ src: kit.logo.dataUrl, aspect: kit.logo.aspect, position: kit.logo.position, sizePct: kit.logo.sizePct, opacity: kit.logo.opacity });
++        return (
++          <div key={kit.id} className={`rounded-xl border overflow-hidden transition-colors ${
++            isApplied
++              ? 'border-amber-400/70 shadow-[0_0_0_1px_rgba(245,158,11,0.3),0_0_20px_rgba(245,158,11,0.14)]'
++              : 'border-white/[0.07] hover:border-white/[0.18]'}`}>
++            <div className="flex items-center justify-between gap-2 px-3 py-2 bg-black/[0.25]">
++              <span className="text-[11px] font-semibold text-zinc-200 truncate">{kit.name}</span>
++              {isApplied && <span className="text-[9px] font-bold text-emerald-300 shrink-0">APPLIED</span>}
++            </div>
++            <div className="flex items-center gap-2.5 px-3 py-2.5" style={{ background: 'linear-gradient(160deg,#0f0f16 0%,#09090f 100%)' }}>
++              <div className="flex gap-1 shrink-0">
++                {BRAND_COLOR_ROLES.filter(r => kit.colors[r]).map(r => (
++                  <Tooltip key={r} label={`${BRAND_COLOR_ROLE_LABELS[r]} ${kit.colors[r]}`}>
++                    <span className="block w-4 h-4 rounded-full border border-white/20" style={{ background: kit.colors[r] }} />
++                  </Tooltip>
++                ))}
++                {BRAND_COLOR_ROLES.every(r => !kit.colors[r]) && <span className="text-[10px] text-zinc-600">No colours</span>}
++              </div>
++              <span className="flex-1 min-w-0 text-[12px] text-zinc-300 truncate"
++                style={kit.font ? { fontFamily: `'${kit.font.name}', sans-serif` } : undefined}>
++                {kit.font?.name ?? 'Template font'}
++              </span>
++              <div className="relative rounded-md overflow-hidden border border-white/[0.08] bg-[#0b0b0f] shrink-0" style={{ width: 27, height: 48 }}>
++                {logo && <BrandLogoOverlay logo={logo} frameWidth={27} frameHeight={48} />}
++              </div>
++            </div>
++            <div className="flex items-center gap-1 px-2 py-1.5 bg-black/[0.18] border-t border-white/[0.05]">
++              <Tooltip label={`Apply this kit to ${templateName}`} className="flex-1">
++                <button onClick={() => p.onApply(kit)}
++                  className="w-full py-1.5 rounded-lg bg-amber-500/20 border border-amber-400/40 text-[10.5px] font-bold text-amber-300 hover:bg-amber-500/30 transition-colors cursor-pointer">
++                  {isApplied ? 'Re-apply' : 'Apply kit'}
++                </button>
++              </Tooltip>
++              <Tooltip label="Edit this kit">
++                <button onClick={() => { setDraft(kit); setError(''); }} aria-label="Edit kit"
++                  className="p-1.5 rounded text-zinc-500 hover:text-zinc-200 transition-colors cursor-pointer">
++                  <Pencil className="w-3 h-3" />
++                </button>
++              </Tooltip>
++              <Tooltip label="Delete this kit">
++                <button onClick={() => handleDelete(kit)} aria-label="Delete kit"
++                  className="p-1.5 rounded text-zinc-600 hover:text-red-400 transition-colors cursor-pointer">
++                  <Trash2 className="w-3 h-3" />
++                </button>
++              </Tooltip>
++            </div>
++          </div>
++        );
++      })}
++    </div>
++  );
++}
++
++// ── Editor ────────────────────────────────────────────────────────────────────
++
++function BrandKitEditor({ draft, onChange, onSave, onCancel, error }: {
++  draft: BrandKit;
++  onChange: (k: BrandKit) => void;
++  onSave: (k: BrandKit) => void;
++  onCancel: () => void;
++  error: string;
++}) {
++  const [fontOpen, setFontOpen] = useState(false);
++  const [logoErr, setLogoErr] = useState('');
++  const [busy, setBusy] = useState(false);
++  const fileRef = useRef<HTMLInputElement>(null);
++
++  const setColor = (role: BrandColorRole, hex: string | null) => {
++    const colors = { ...draft.colors };
++    const clean = hex && normalizeHex(hex);
++    if (clean) colors[role] = clean; else delete colors[role];
++    onChange({ ...draft, colors });
++  };
++  const patchLogo = (patch: Partial<NonNullable<BrandKit['logo']>>) => {
++    if (!draft.logo) return;
++    onChange({ ...draft, logo: { ...draft.logo, ...patch } });
++  };
++
++  const onLogoFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
++    const file = e.target.files?.[0];
++    e.target.value = '';
++    if (!file) return;
++    const invalid = validateBrandLogoFile(file);
++    if (invalid) { setLogoErr(invalid); return; }
++    setBusy(true);
++    setLogoErr('');
++    try {
++      const { dataUrl, aspect } = await prepareLogo(file);
++      onChange({
++        ...draft,
++        logo: {
++          dataUrl, aspect, fileName: file.name,
++          position: draft.logo?.position ?? 'top-right',
++          sizePct: draft.logo?.sizePct ?? BRAND_LOGO_SIZE.default,
++          opacity: draft.logo?.opacity ?? BRAND_LOGO_OPACITY.default,
++        },
++      });
++    } catch (err) {
++      setLogoErr(err instanceof Error ? err.message : 'Could not read that image.');
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  const previewLogo = draft.logo && sanitizeBrandLogo({
++    src: draft.logo.dataUrl, aspect: draft.logo.aspect, position: draft.logo.position,
++    sizePct: draft.logo.sizePct, opacity: draft.logo.opacity,
++  });
++
++  return (
++    <div className="space-y-3">
++      <input
++        value={draft.name}
++        onChange={e => onChange({ ...draft, name: e.target.value.slice(0, 60) })}
++        placeholder="Kit name"
++        aria-label="Kit name"
++        className="w-full bg-white/[0.06] border border-white/[0.08] rounded-xl text-[11px] text-white placeholder:text-zinc-600 py-2 px-3 outline-none focus:border-amber-400/40"
++      />
++
++      <div className="space-y-2">
++        <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest block">Colours</span>
++        {BRAND_COLOR_ROLES.map(role => (
++          draft.colors[role] ? (
++            <ColorField
++              key={role} compact label={BRAND_COLOR_ROLE_LABELS[role]} hex={draft.colors[role]!}
++              onHex={h => setColor(role, h)}
++              onReset={() => setColor(role, null)} showReset
++            />
++          ) : (
++            <button key={role} onClick={() => setColor(role, DEFAULT_ROLE_COLOR[role])}
++              className="w-full flex items-center gap-2 py-1.5 px-2 rounded-xl border border-dashed border-white/[0.12] text-[10.5px] text-zinc-500 hover:text-zinc-200 hover:border-white/[0.24] transition-colors cursor-pointer">
++              <Plus className="w-3 h-3" /> Add {BRAND_COLOR_ROLE_LABELS[role].toLowerCase()} colour
++            </button>
++          )
++        ))}
++      </div>
++
++      <div className="space-y-2">
++        <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest block">Font</span>
++        <div className="flex items-center gap-2">
++          <button onClick={() => setFontOpen(o => !o)}
++            className="flex-1 min-w-0 flex items-center justify-between bg-white/[0.06] border border-white/[0.08] rounded-md px-2.5 py-1.5 cursor-pointer hover:border-white/[0.16]">
++            <span className="text-[11px] text-white font-semibold truncate"
++              style={draft.font ? { fontFamily: `'${draft.font.name}', sans-serif` } : undefined}>
++              {draft.font?.name ?? 'Template default'}
++            </span>
++          </button>
++          <ResetBtn show={!!draft.font} onClick={() => onChange({ ...draft, font: null })} title="Use each template's own font" />
++        </div>
++        {fontOpen && (
++          <div className="rounded-xl border border-white/[0.08] bg-black/30 max-h-[260px] overflow-y-auto">
++            <FontsPanel
++              selectedFont={draft.font?.name ?? null}
++              onFontSelect={sel => onChange({ ...draft, font: sel ? { name: sel.name, isCustom: sel.isCustom, data: sel.data } : null })}
++            />
++          </div>
++        )}
++      </div>
++
++      <div className="space-y-2">
++        <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest block">Logo</span>
++        <input ref={fileRef} type="file" className="hidden" onChange={onLogoFile}
++          accept="image/png,image/jpeg,image/webp,image/svg+xml,.png,.jpg,.jpeg,.webp,.svg" />
++        <div className="flex items-start gap-2.5">
++          <div className="relative rounded-lg overflow-hidden border border-white/[0.08] bg-[#0b0b0f] shrink-0" style={{ width: 54, height: 96 }}>
++            {previewLogo && <BrandLogoOverlay logo={previewLogo} frameWidth={54} frameHeight={96} />}
++          </div>
++          <div className="flex-1 min-w-0 space-y-1.5">
++            <button onClick={() => fileRef.current?.click()} disabled={busy}
++              className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-white/[0.1] text-[10.5px] font-semibold text-zinc-200 hover:bg-white/[0.05] transition-colors cursor-pointer disabled:opacity-50">
++              <Upload className="w-3 h-3" /> {busy ? 'Reading…' : draft.logo ? 'Replace logo' : 'Upload logo'}
++            </button>
++            {draft.logo && (
++              <button onClick={() => onChange({ ...draft, logo: null })}
++                className="w-full py-1.5 rounded-lg text-[10.5px] text-zinc-500 hover:text-red-300 transition-colors cursor-pointer">
++                Remove logo
++              </button>
++            )}
++            <p className="text-[10px] text-zinc-600 leading-relaxed">PNG, JPG, WebP or SVG · up to 1 MB · stays on this device</p>
++          </div>
++        </div>
++        {logoErr && <p className="text-[10.5px] text-red-300">{logoErr}</p>}
++
++        {draft.logo && (
++          <div className="space-y-2 pt-0.5">
++            <div className="flex items-center gap-2">
++              <span className="text-[11px] text-zinc-400 w-[64px] shrink-0">Corner</span>
++              <div className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-white/[0.04] border border-white/[0.06]">
++                {BRAND_LOGO_POSITIONS.map(pos => (
++                  <Tooltip key={pos} label={POSITION_LABELS[pos]}>
++                    <button
++                      onClick={() => patchLogo({ position: pos })}
++                      aria-label={POSITION_LABELS[pos]}
++                      aria-pressed={draft.logo!.position === pos}
++                      className={`w-6 h-6 rounded-md flex p-1 transition-colors cursor-pointer ${
++                        draft.logo!.position === pos ? 'bg-amber-500/25 border border-amber-400/40' : 'border border-transparent hover:bg-white/[0.06]'
++                      } ${pos.endsWith('right') ? 'justify-end' : 'justify-start'} ${pos.startsWith('bottom') ? 'items-end' : 'items-start'}`}
++                    >
++                      <span className={`block w-2 h-2 rounded-[2px] ${draft.logo!.position === pos ? 'bg-amber-300' : 'bg-zinc-600'}`} />
++                    </button>
++                  </Tooltip>
++                ))}
++              </div>
++            </div>
++            <SliderRow
++              label="Size" value={Math.round(draft.logo.sizePct)} min={BRAND_LOGO_SIZE.min} max={BRAND_LOGO_SIZE.max} step={1}
++              onChange={v => patchLogo({ sizePct: v })} display={v => `${v}%`} defaultValue={BRAND_LOGO_SIZE.default}
++            />
++            <SliderRow
++              label="Opacity" value={Math.round(draft.logo.opacity * 100)} min={10} max={100} step={5}
++              onChange={v => patchLogo({ opacity: v / 100 })} display={v => `${v}%`}
++              defaultValue={Math.round(BRAND_LOGO_OPACITY.default * 100)}
++            />
++          </div>
++        )}
++      </div>
++
++      {error && <p className="text-[10.5px] text-red-300">{error}</p>}
++
++      <div className="flex items-center gap-1.5 pt-1">
++        <button onClick={() => onSave({ ...draft, name: draft.name.trim() || 'My brand kit' })}
++          className="flex-1 py-2 rounded-xl bg-amber-500/20 border border-amber-400/40 text-[10.5px] font-bold text-amber-300 hover:bg-amber-500/30 transition-colors cursor-pointer">
++          Save kit
++        </button>
++        <button onClick={onCancel}
++          className="px-3 py-2 rounded-xl text-[10.5px] font-semibold text-zinc-500 hover:text-zinc-200 transition-colors cursor-pointer">
++          Cancel
++        </button>
++      </div>
++    </div>
++  );
++}
++
++/** Sensible starting swatches so a new row opens on something visible, not black. */
++const DEFAULT_ROLE_COLOR: Record<BrandColorRole, string> = {
++  text: '#ffffff',
++  highlight: '#ff5a1f',
++  secondary: '#7c3aed',
++  box: '#14213d',
++};
+diff --git a/src/components/editor/panel/TemplatesTab.tsx b/src/components/editor/panel/TemplatesTab.tsx
+index 75c6f57..0137190 100644
+--- a/src/components/editor/panel/TemplatesTab.tsx
++++ b/src/components/editor/panel/TemplatesTab.tsx
+@@ -13,6 +13,7 @@ import { CAPTION_STYLES, STYLE_CATEGORIES, styleCategory } from '@/lib/captionSt
+ import { isHeroTemplate, isStyleLocked } from '@/lib/styleResolve';
+ import { listPresets, savePreset, deletePreset, type StylePreset } from '@/lib/presetStore';
+ import { Segmented, ColorField } from './controls';
++import BrandKitPanel, { type BrandKitControls } from './BrandKitPanel';
+ import Tooltip from '@/components/ui/Tooltip';
+ 
+ // ── One-time "new templates" tip ──────────────────────────────────────────────
+@@ -44,10 +45,12 @@ export interface TemplatesTabProps {
+   /** Reset the active template's customizations (accent/emphasis/layout). */
+   onRemoveStyleCustomizations: () => void;
+   hasStyleCustomizations: boolean;
++  /** Brand Kit section — omitted where the editor doesn't offer it. */
++  brandKit?: BrandKitControls;
+ }
+ 
+ export default function TemplatesTab(p: TemplatesTabProps) {
+-  const [view, setView] = useState<'builtin' | 'presets'>('builtin');
++  const [view, setView] = useState<'builtin' | 'presets' | 'brandkit'>('builtin');
+   const [query, setQuery] = useState('');
+   const [presets, setPresets] = useState<StylePreset[]>([]);
+   const [savingName, setSavingName] = useState<string | null>(null);
+@@ -88,9 +91,14 @@ export default function TemplatesTab(p: TemplatesTabProps) {
+       {/* View switch + search + save preset */}
+       <div className="p-2.5 space-y-2 shrink-0">
+         <Segmented size="sm"
+-          options={[{ id: 'builtin', label: 'Built-in Templates' }, { id: 'presets', label: 'My Presets' }]}
++          options={[
++            { id: 'builtin' as const, label: 'Built-in' },
++            { id: 'presets' as const, label: 'My Presets' },
++            ...(p.brandKit ? [{ id: 'brandkit' as const, label: 'Brand Kit' }] : []),
++          ]}
+           value={view} onChange={setView}
+         />
++        {view !== 'brandkit' && (
+         <div className="flex items-center gap-1.5">
+           <div className="flex-1 flex items-center bg-white/[0.04] rounded-xl border border-white/[0.07] px-2.5 min-w-0">
+             <Search className="w-3 h-3 text-zinc-600 shrink-0" />
+@@ -109,7 +117,8 @@ export default function TemplatesTab(p: TemplatesTabProps) {
+           </button>
+           </Tooltip>
+         </div>
+-        {savingName !== null && (
++        )}
++        {view !== 'brandkit' && savingName !== null && (
+           <div className="flex items-center gap-1.5">
+             <input
+               autoFocus value={savingName} onChange={e => setSavingName(e.target.value)}
+@@ -155,7 +164,9 @@ export default function TemplatesTab(p: TemplatesTabProps) {
+               className="text-[11px] text-zinc-500 hover:text-zinc-300 leading-none cursor-pointer px-1 py-0.5 shrink-0">✕</button>
+           </div>
+         )}
+-        {view === 'builtin' ? (
++        {view === 'brandkit' && p.brandKit ? (
++          <BrandKitPanel captionStyle={p.captionStyle} {...p.brandKit} />
++        ) : view === 'builtin' ? (
+           STYLE_CATEGORIES.map(cat => {
+             const inCat = styles.filter(s => styleCategory(s.id) === cat.key);
+             if (!inCat.length) return null;
+diff --git a/src/lib/__tests__/brandKit.spec.ts b/src/lib/__tests__/brandKit.spec.ts
+new file mode 100644
+index 0000000..2620bfa
+--- /dev/null
++++ b/src/lib/__tests__/brandKit.spec.ts
+@@ -0,0 +1,370 @@
++/**
++ * Brand Kit core — the colour-role mapping, the ownership ledger that applies / re-maps / removes a
++ * kit, and the logo + record helpers.
++ *
++ * The mapping tests pin two promises: EVERY template id has a mapping whose targets are colour inputs
++ * that template really reads (a kit colour aimed at an input nobody reads silently does nothing), and a
++ * font-locked template never receives the kit font. The ledger tests pin "Remove kit restores the
++ * previous look" — including after template switches and after the creator edits a colour themselves.
++ */
++import { describe, it, expect } from 'vitest';
++import { CAPTION_STYLES } from '@/lib/captionStyles';
++import { FONT_LOCKED_STYLES, type CaptionStyleId } from '@/remotion/KineticCaptionComposition';
++import { isHeroTemplate, isStyleLocked } from '@/lib/styleResolve';
++import {
++  resolveIllusionSlots, resolveEditorMasalaSlots, resolveAuraSlots, resolveSwissSlots,
++  resolveScribbleSlots, resolveArchivesSlots, resolveBlockbusterSlots, resolveInterlockSlots, resolveJournalSlots,
++} from '@/lib/kineticSlots';
++import type {
++  ArchivesSlots, AuraSlots, BlockbusterSlots, EditorMasalaSlots, IllusionSlots, InterlockSlots,
++  JournalSlots, ScribbleSlots, TemplateSlotOverrides,
++} from '@/types/transcript';
++import {
++  BRAND_COLOR_ROLES, SLOT_COLOR_FIELDS, TEMPLATE_COLOR_RULES, TEMPLATE_FIXED_COLOUR_NOTES, TEMPLATE_SLOT_KEY,
++  applyBrandPatch, brandLogoFromKit, brandMapKey, contrastRatio, createBrandKit, emptyBrandLedger,
++  explicitGlobalColor, fromBrandKitRecord, isBrandKitRecord, mapBrandColors, mapBrandKit,
++  normalizeAppliedBrandKit, normalizeBrandKit, normalizeHex, remapBrandKit, removeBrandKitFromLook,
++  rolesUsedByTemplate, svgIntrinsicSize, toBrandKitRecord, validateBrandLogoFile, brandLogoMime,
++  withoutBrandColors, MIN_BRAND_CONTRAST,
++  type BrandKit, type BrandLook, type BrandKitColors,
++} from '@/lib/brandKit';
++import { brandLogoBox, sanitizeBrandLogo, BRAND_LOGO_MARGIN_FRAC } from '@/lib/brandLogo';
++
++const PNG_1PX = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
++
++const ALL_IDS = CAPTION_STYLES.map(s => s.id);
++const FULL_KIT: BrandKitColors = { text: '#f4f1ea', highlight: '#ff5a1f', secondary: '#7c3aed', box: '#14213d' };
++
++const baseLook = (over: Partial<BrandLook> = {}): BrandLook => ({
++  captionTextColor: '#ffffff',
++  accentColor: '#06b6d4',
++  emphasisStyle: {},
++  templateSlots: {},
++  textOverrides: {},
++  font: { name: null, data: null, isCustom: false },
++  ...over,
++});
++
++const kitWith = (over: Partial<BrandKit> = {}): BrandKit => ({ ...createBrandKit({ name: 'Acme', colors: FULL_KIT }, 1), ...over });
++
++/** Slot resolvers — the functions the render branches read their colours through. */
++const SLOT_RESOLVERS: Record<keyof TemplateSlotOverrides, (g: Record<string, string>) => Record<string, unknown>> = {
++  illusion: g => ({ ...resolveIllusionSlots(g as IllusionSlots) }),
++  editor_masala: g => ({ ...resolveEditorMasalaSlots(g as EditorMasalaSlots) }),
++  aura: g => ({ ...resolveAuraSlots(g as AuraSlots) }),
++  aura_helvetica: g => ({ ...resolveSwissSlots(g as AuraSlots) }),
++  scribble: g => ({ ...resolveScribbleSlots(g as ScribbleSlots) }),
++  archives: g => ({ ...resolveArchivesSlots(g as ArchivesSlots) }),
++  blockbuster: g => ({ ...resolveBlockbusterSlots(g as BlockbusterSlots) }),
++  interlock: g => ({ ...resolveInterlockSlots(g as InterlockSlots) }),
++  journal: g => ({ ...resolveJournalSlots(g as JournalSlots) }),
++};
++
++describe('TEMPLATE_COLOR_RULES — every template gets a valid mapping', () => {
++  it('covers every template in CAPTION_STYLES (and nothing unknown)', () => {
++    for (const id of ALL_IDS) expect(TEMPLATE_COLOR_RULES[id], id).toBeDefined();
++  });
++
++  it.each(ALL_IDS)('%s: rules target inputs the template really reads', (id) => {
++    const rules = TEMPLATE_COLOR_RULES[id];
++    if (rules.length === 0) expect(TEMPLATE_FIXED_COLOUR_NOTES[id], `${id} maps nothing, so it must explain why`).toBeTruthy();
++    const seen = new Set<string>();
++    for (const rule of rules) {
++      expect(seen.has(rule.id), `${id}: duplicate rule id ${rule.id}`).toBe(false);
++      expect(rule.roles.length).toBeGreaterThan(0);
++      for (const role of rule.roles) expect(BRAND_COLOR_ROLES).toContain(role);
++      if (rule.on && 'rule' in rule.on) expect(seen.has(rule.on.rule), `${id}: ${rule.id} must come after ${rule.on.rule}`).toBe(true);
++      seen.add(rule.id);
++
++      switch (rule.target.kind) {
++        case 'slot': {
++          const key = TEMPLATE_SLOT_KEY[id];
++          expect(key, `${id} has no slot store`).toBeDefined();
++          expect(SLOT_COLOR_FIELDS[key!]).toContain(rule.target.field);
++          break;
++        }
++        case 'emphasisHex':
++          // only the hero family paints emphasisStyle.hex inline
++          expect(isHeroTemplate(id)).toBe(true);
++          break;
++        default:
++          // global colour / Text-tab background: locked templates never read the Text-tab overrides
++          expect(isStyleLocked(id), `${id} is style-locked; map its slots instead`).toBe(false);
++      }
++    }
++    // A template with its own slot store is driven through the slots only.
++    if (TEMPLATE_SLOT_KEY[id]) for (const r of rules) expect(r.target.kind).toBe('slot');
++  });
++
++  it.each(Object.entries(SLOT_COLOR_FIELDS))('slot store %s: every mapped field is read by its resolver', (key, fields) => {
++    const resolve = SLOT_RESOLVERS[key as keyof TemplateSlotOverrides];
++    for (const field of fields) {
++      expect(resolve({ [field]: '#123456' })[field], `${key}.${field}`).toBe('#123456');
++    }
++  });
++
++  it.each(ALL_IDS)('%s: a full kit maps to well-formed values only', (id) => {
++    const { patch } = mapBrandKit(id, { colors: FULL_KIT, font: null });
++    for (const [path, value] of Object.entries(patch)) {
++      if (path === 'background') {
++        expect(normalizeHex((value as { hex: string }).hex)).toBe((value as { hex: string }).hex);
++      } else {
++        expect(typeof value, path).toBe('string');
++        expect(normalizeHex(value), `${id} ${path}=${String(value)}`).toBe(value);
++      }
++      if (path.startsWith('slot:')) expect(path.startsWith(`slot:${TEMPLATE_SLOT_KEY[id]}.`)).toBe(true);
++    }
++  });
++
++  it('never adds a background pill to a template that has none', () => {
++    for (const id of ALL_IDS) {
++      if (id === 'ali_abdaal') continue;
++      expect(mapBrandColors(id, FULL_KIT).patch.background, id).toBeUndefined();
++    }
++  });
++
++  it('reports the roles each template reads', () => {
++    expect(rolesUsedByTemplate('hormozi')).toEqual(['text']);
++    expect(rolesUsedByTemplate('captik')).toEqual(['text', 'highlight']);
++    expect(rolesUsedByTemplate('scribble')).toEqual(['text', 'highlight', 'secondary', 'box']);
++    expect(rolesUsedByTemplate('black_punch')).toEqual([]);
++  });
++});
++
++describe('mapBrandColors', () => {
++  it('hero family: text → caption text, highlight → accent AND emphasis colour', () => {
++    const { patch } = mapBrandColors('captik', FULL_KIT);
++    expect(patch).toEqual({ captionTextColor: '#f4f1ea', accentColor: '#ff5a1f', emphasisHex: '#ff5a1f' });
++  });
++
++  it('shifts a colour equal to the editor default by 1/255 so templates treat it as chosen', () => {
++    expect(explicitGlobalColor('#ffffff', 'captionTextColor')).toBe('#fffffe');
++    expect(explicitGlobalColor('#06b6d4', 'accentColor')).toBe('#06b6d3');
++    expect(explicitGlobalColor('#123456', 'captionTextColor')).toBe('#123456');
++    expect(mapBrandColors('hormozi', { text: '#FFFFFF' }).patch.captionTextColor).toBe('#fffffe');
++  });
++
++  it('slot templates write their own slot store', () => {
++    expect(mapBrandColors('aura_helvetica', FULL_KIT).patch).toEqual({
++      'slot:aura_helvetica.baseColor': '#f4f1ea', 'slot:aura_helvetica.accentColor': '#ff5a1f',
++    });
++    expect(mapBrandColors('editor_masala', FULL_KIT).patch['slot:editor_masala.heroAColor']).toBe('#7c3aed');
++  });
++
++  it('ali_abdaal: recolours the pill and keeps the text readable on it', () => {
++    expect(mapBrandColors('ali_abdaal', FULL_KIT).patch).toEqual({
++      background: { hex: '#14213d', opacity: 100, radius: 14, padW: 36, padH: 16 },
++      captionTextColor: '#f4f1ea',
++    });
++    // White text on a white pill: neither applies, and the panel is told why.
++    const white = mapBrandColors('ali_abdaal', { text: '#ffffff', box: '#ffffff' });
++    expect(white.patch).toEqual({});
++    expect(white.notes).toContainEqual({ kind: 'legibility', label: 'Pill' });
++    // A dark pill with no kit text: the template's black text would vanish → white instead.
++    const dark = mapBrandColors('ali_abdaal', { box: '#101010' });
++    expect(dark.patch.captionTextColor).toBe('#fffffe');
++  });
++
++  it('bubble: a bubble too dark for its black text falls back to the highlight colour', () => {
++    const { patch } = mapBrandColors('bubble', { box: '#14213d', highlight: '#ffd400' });
++    expect(patch.accentColor).toBe('#ffd400');
++    expect(contrastRatio('#ffd400', '#000000')).toBeGreaterThanOrEqual(MIN_BRAND_CONTRAST);
++  });
++
++  it('scribble: a dark kit marker gets light ink on it', () => {
++    const { patch } = mapBrandColors('scribble', { highlight: '#1d1d1f' });
++    expect(patch['slot:scribble.markerColor']).toBe('#1d1d1f');
++    expect(patch['slot:scribble.inkColor']).toBe('#ffffff');
++    // The default yellow-ish marker keeps the template's dark ink.
++    expect(mapBrandColors('scribble', { highlight: '#ffe600' }).patch['slot:scribble.inkColor']).toBeUndefined();
++  });
++
++  it('ignores missing and malformed colours', () => {
++    expect(mapBrandColors('captik', {}).patch).toEqual({});
++    expect(mapBrandColors('captik', { text: 'red', highlight: '#12' }).patch).toEqual({});
++    expect(mapBrandColors('captik', { text: 'ABC' }).patch).toEqual({ captionTextColor: '#aabbcc' });
++  });
++});
++
++describe('mapBrandKit — font', () => {
++  const font = { name: 'Bebas Neue', isCustom: false, data: new Uint8Array([1, 2, 3]) };
++
++  it.each(ALL_IDS)('%s: font applied unless the template is font-locked', (id) => {
++    const m = mapBrandKit(id, { colors: {}, font });
++    if ((FONT_LOCKED_STYLES as CaptionStyleId[]).includes(id)) {
++      expect(m.patch.font).toBeUndefined();
++      expect(m.notes).toContainEqual({ kind: 'font-locked' });
++    } else {
++      expect(m.patch.font).toEqual({ name: 'Bebas Neue', data: font.data, isCustom: false });
++    }
++  });
++
++  it('maps slot colours of per-caption templates, global fields follow the project template', () => {
++    const { patch } = mapBrandKit('hormozi', { colors: FULL_KIT }, ['aura', 'aura', 'bubble']);
++    expect(patch.captionTextColor).toBe('#f4f1ea');
++    expect(patch['slot:aura.accentColor']).toBe('#ff5a1f');
++    expect(patch.accentColor).toBeUndefined();   // bubble's accent would fight hormozi's global fields
++  });
++
++  it('keys a mapping by the template set, order-insensitive', () => {
++    expect(brandMapKey('aura', ['b', 'a', 'b'])).toBe(brandMapKey('aura', ['a', 'b']));
++    expect(brandMapKey('aura')).not.toBe(brandMapKey('captik'));
++  });
++});
++
++describe('ownership ledger — apply, re-map, remove', () => {
++  const apply = (look: BrandLook, styleId: CaptionStyleId, kit = kitWith()) =>
++    remapBrandKit(look, emptyBrandLedger(), mapBrandKit(styleId, kit).patch);
++
++  it.each(['captik', 'ali_abdaal', 'aura', 'scribble', 'journal', 'black_punch'] as CaptionStyleId[])(
++    '%s: remove restores exactly the look before the kit', (styleId) => {
++      const before = baseLook({
++        emphasisStyle: { size: 1.8 },
++        templateSlots: { aura: { inAnimation: 'up' } },
++        font: { name: 'Anton', data: new Uint8Array([9]), isCustom: false },
++      });
++      const kit = kitWith({ font: { name: 'Bebas Neue', isCustom: false } });
++      const { look, ledger } = apply(before, styleId, kit);
++      expect(look).not.toEqual(before);
++      expect(removeBrandKitFromLook(look, ledger)).toEqual(before);
++    });
++
++  it('an edit made after applying survives Remove kit', () => {
++    const { look, ledger } = apply(baseLook(), 'captik');
++    const edited = { ...look, captionTextColor: '#00ff00' };
++    const removed = removeBrandKitFromLook(edited, ledger);
++    expect(removed.captionTextColor).toBe('#00ff00');
++    expect(removed.accentColor).toBe('#06b6d4');
++    expect(removed.emphasisStyle).toEqual({});
++  });
++
++  it('switching templates re-maps: stale global fields are handed back, new slots are owned', () => {
++    const start = baseLook();
++    const first = apply(start, 'ali_abdaal');
++    expect(first.look.textOverrides.background?.hex).toBe('#14213d');
++
++    // → aura: the pill background must not follow onto a template that never had a pill.
++    const toAura = remapBrandKit(first.look, first.ledger, mapBrandKit('aura', kitWith()).patch);
++    expect(toAura.look.textOverrides.background).toBeUndefined();
++    expect(toAura.look.captionTextColor).toBe('#ffffff');
++    expect(toAura.look.templateSlots.aura).toEqual({ baseColor: '#f4f1ea', accentColor: '#ff5a1f' });
++
++    expect(removeBrandKitFromLook(toAura.look, toAura.ledger)).toEqual(start);
++  });
++
++  it('a font-locked template hands the font back; the next unlocked template takes it again', () => {
++    const kit = kitWith({ font: { name: 'Bebas Neue', isCustom: false } });
++    const a = apply(baseLook(), 'captik', kit);
++    expect(a.look.font.name).toBe('Bebas Neue');
++    const locked = remapBrandKit(a.look, a.ledger, mapBrandKit('journal', kit).patch);
++    expect(locked.look.font.name).toBeNull();
++    const back = remapBrandKit(locked.look, locked.ledger, mapBrandKit('hormozi', kit).patch);
++    expect(back.look.font.name).toBe('Bebas Neue');
++    expect(removeBrandKitFromLook(back.look, back.ledger).font.name).toBeNull();
++  });
++
++  it('a field reset by a template switch re-records its prior value, so removal returns to it', () => {
++    const a = apply(baseLook({ captionTextColor: '#aaaaaa' }), 'captik');
++    // The editor's template switch restores the new template's remembered colour…
++    const switched = { ...a.look, captionTextColor: '#bbbbbb' };
++    const b = remapBrandKit(switched, a.ledger, mapBrandKit('hormozi', kitWith()).patch);
++    expect(b.look.captionTextColor).toBe('#f4f1ea');
++    expect(removeBrandKitFromLook(b.look, b.ledger).captionTextColor).toBe('#bbbbbb');
++  });
++
++  it('applyBrandPatch records the prior value only the first time a field is taken', () => {
++    const one = applyBrandPatch(baseLook(), { accentColor: '#111111' });
++    const two = applyBrandPatch(one.look, { accentColor: '#222222' }, one.ledger);
++    expect(two.ledger.before.accentColor).toBe('#06b6d4');
++    expect(removeBrandKitFromLook(two.look, two.ledger).accentColor).toBe('#06b6d4');
++  });
++
++  it('per-template colour memory never keeps kit colours', () => {
++    const { look, ledger } = apply(baseLook({ captionTextColor: '#aaaaaa' }), 'captik');
++    expect(withoutBrandColors({ accentColor: look.accentColor, captionTextColor: look.captionTextColor }, ledger))
++      .toEqual({ accentColor: '#06b6d4', captionTextColor: '#aaaaaa' });
++    expect(withoutBrandColors({ accentColor: '#123123', captionTextColor: '#aaaaaa' }, ledger))
++      .toEqual({ accentColor: '#123123', captionTextColor: '#aaaaaa' });
++  });
++});
++
++describe('persisted shapes', () => {
++  it('a kit record is tagged, carries preset-shaped fallbacks, and round-trips', () => {
++    const kit = kitWith({ font: { name: 'Mine', isCustom: true, data: new Uint8Array([7, 7]) }, logo: {
++      dataUrl: PNG_1PX, aspect: 2, position: 'bottom-left', sizePct: 20, opacity: 0.5,
++    } });
++    const rec = toBrandKitRecord(kit);
++    expect(isBrandKitRecord(rec)).toBe(true);
++    expect(isBrandKitRecord({ id: 'p_1', styleId: 'hormozi' })).toBe(false);
++    // An older build lists this record as a preset — every field its apply handler reads exists.
++    expect(rec).toMatchObject({ styleId: 'hormozi', accentColor: '#ff5a1f', captionTextColor: '#f4f1ea', captionFontScale: 1, captionLines: 'single' });
++    expect(rec.captionBox.yPercent).toBe(85);
++    expect(fromBrandKitRecord(rec)).toEqual(kit);
++  });
++
++  it('normalizeBrandKit drops what it cannot trust', () => {
++    const k = normalizeBrandKit({
++      id: 'bk_1', name: '  '.padEnd(80, 'x'), colors: { text: 'nope', box: '#ABC' },
++      font: { name: '' }, logo: { dataUrl: 'https://evil.example/logo.png', aspect: 1 },
++    });
++    expect(k?.colors).toEqual({ box: '#aabbcc' });
++    expect(k?.font).toBeNull();
++    expect(k?.logo).toBeNull();
++    expect(k!.name.length).toBeLessThanOrEqual(60);
++    expect(normalizeBrandKit({ name: 'no id' })).toBeNull();
++  });
++
++  it('normalizeAppliedBrandKit restores a snapshot value and rejects garbage', () => {
++    const kit = kitWith();
++    const { ledger } = remapBrandKit(baseLook(), emptyBrandLedger(), mapBrandKit('captik', kit).patch);
++    const applied = { kit, ledger, mappedFor: brandMapKey('captik'), notes: [], appliedAt: 5 };
++    expect(normalizeAppliedBrandKit(JSON.parse(JSON.stringify(applied)))).toEqual(applied);
++    expect(normalizeAppliedBrandKit(undefined)).toBeNull();
++    expect(normalizeAppliedBrandKit({ kit: { name: 'x' } })).toBeNull();
++  });
++});
++
++describe('logo helpers', () => {
++  it('validates logo files: PNG/JPG/WebP/SVG, 1 MB max', () => {
++    expect(validateBrandLogoFile({ name: 'a.png', type: 'image/png', size: 1000 })).toBeNull();
++    expect(validateBrandLogoFile({ name: 'a.svg', type: '', size: 1000 })).toBeNull();
++    expect(validateBrandLogoFile({ name: 'a.gif', type: 'image/gif', size: 1000 })).toMatch(/PNG, JPG, WebP or SVG/);
++    expect(validateBrandLogoFile({ name: 'a.webp', type: 'image/webp', size: 1024 * 1024 + 1 })).toMatch(/1 MB/);
++    expect(validateBrandLogoFile({ name: 'a.jpg', type: 'image/jpeg', size: 0 })).toMatch(/empty/);
++    expect(brandLogoMime({ name: 'LOGO.JPG', type: '' })).toBe('image/jpeg');
++  });
++
++  it('reads an SVG size from width/height, else viewBox', () => {
++    expect(svgIntrinsicSize('<svg xmlns="http://www.w3.org/2000/svg" width="120px" height="40">')).toEqual({ w: 120, h: 40 });
++    expect(svgIntrinsicSize('<svg viewBox="0 0 300 100"><rect/></svg>')).toEqual({ w: 300, h: 100 });
++    expect(svgIntrinsicSize('<svg width="100%">')).toBeNull();
++  });
++
++  it('sanitizeBrandLogo only accepts inline image data URLs and clamps the rest', () => {
++    expect(sanitizeBrandLogo({ src: 'https://example.com/a.png', aspect: 1, position: 'top-left', sizePct: 10, opacity: 1 })).toBeNull();
++    expect(sanitizeBrandLogo({ src: 'data:text/html;base64,PGgxPg==', aspect: 1 })).toBeNull();
++    expect(sanitizeBrandLogo(null)).toBeNull();
++    expect(sanitizeBrandLogo({ src: PNG_1PX, aspect: 'x', position: 'middle', sizePct: 99, opacity: 0 }))
++      .toEqual({ src: PNG_1PX, aspect: 1, position: 'top-right', sizePct: 40, opacity: 0.1 });
++  });
++
++  it('brandLogoBox: corners, proportional between preview and export, tall logos capped', () => {
++    const logo = { aspect: 2, position: 'bottom-right' as const, sizePct: 20 };
++    const exp = brandLogoBox(1080, 1920, logo);
++    const pre = brandLogoBox(270, 480, logo);
++    for (const k of ['x', 'y', 'width', 'height'] as const) expect(exp[k]).toBeCloseTo(pre[k] * 4, 6);
++    expect(exp.width).toBeCloseTo(216);
++    expect(exp.x + exp.width).toBeCloseTo(1080 - 1080 * BRAND_LOGO_MARGIN_FRAC);
++    expect(exp.y + exp.height).toBeCloseTo(1920 - 1080 * BRAND_LOGO_MARGIN_FRAC);
++    const tl = brandLogoBox(1080, 1920, { ...logo, position: 'top-left' });
++    expect([tl.x, tl.y]).toEqual([1080 * BRAND_LOGO_MARGIN_FRAC, 1080 * BRAND_LOGO_MARGIN_FRAC]);
++    const tall = brandLogoBox(1920, 1080, { aspect: 0.1, position: 'top-right', sizePct: 40 });
++    expect(tall.height).toBeCloseTo(1080 * 0.4);
++  });
++
++  it('brandLogoFromKit builds the render prop, or nothing without a valid logo', () => {
++    expect(brandLogoFromKit(kitWith())).toBeUndefined();
++    expect(brandLogoFromKit(kitWith({ logo: { dataUrl: PNG_1PX, aspect: 1.5, position: 'top-left', sizePct: 12, opacity: 0.8 } })))
++      .toEqual({ src: PNG_1PX, aspect: 1.5, position: 'top-left', sizePct: 12, opacity: 0.8 });
++  });
++});
+diff --git a/src/lib/__tests__/brandKitStore.spec.ts b/src/lib/__tests__/brandKitStore.spec.ts
+new file mode 100644
+index 0000000..374ebd6
+--- /dev/null
++++ b/src/lib/__tests__/brandKitStore.spec.ts
+@@ -0,0 +1,89 @@
++/**
++ * Brand Kit persistence. Kits share the EXISTING `presets` store (no DB_VER bump), so these pin:
++ *   1. kits round-trip locally — colours, logo data URL and font bytes;
++ *   2. kits and My Presets never leak into each other's lists, and deleting one can't delete the other;
++ *   3. the applied kit rides along in the project snapshot and restores after a reload.
++ */
++import { describe, it, expect, beforeEach } from 'vitest';
++import 'fake-indexeddb/auto';
++import { IDBFactory } from 'fake-indexeddb';
++
++import { listBrandKits, saveBrandKit, deleteBrandKit } from '@/lib/brandKitStore';
++import { listPresets, savePreset, type StylePreset } from '@/lib/presetStore';
++import { getStoredProject, saveStoredProject, type ProjectSnapshot } from '@/lib/projectStore';
++import {
++  brandMapKey, createBrandKit, emptyBrandLedger, mapBrandKit, normalizeAppliedBrandKit, remapBrandKit,
++  type AppliedBrandKit, type BrandKit,
++} from '@/lib/brandKit';
++
++const PNG_1PX = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
++
++const kit = (name: string, now: number): BrandKit => ({
++  ...createBrandKit({
++    name,
++    colors: { text: '#fafafa', highlight: '#ff3366' },
++    font: { name: 'Acme Sans', isCustom: true, data: new Uint8Array([0, 1, 2, 3]) },
++    logo: { dataUrl: PNG_1PX, aspect: 1, position: 'top-left', sizePct: 14, opacity: 0.75 },
++  }, now),
++});
++
++const presetPayload: Omit<StylePreset, 'id' | 'savedAt'> = {
++  name: 'Preset A', styleId: 'captik', accentColor: '#ff0000', captionTextColor: '#ffffff',
++  captionBox: { xPercent: 50, yPercent: 80, widthPercent: 80 }, captionFontScale: 1, captionLines: 'single',
++};
++
++beforeEach(() => {
++  globalThis.indexedDB = new IDBFactory();
++});
++
++describe('brandKitStore', () => {
++  it('saves, lists (newest edit first) and deletes kits, bytes and logo intact', async () => {
++    const a = await saveBrandKit(kit('A', 1), 100);
++    const b = await saveBrandKit(kit('B', 2), 200);
++    expect(a && b).toBeTruthy();
++
++    const listed = await listBrandKits();
++    expect(listed.map(k => k.name)).toEqual(['B', 'A']);
++    expect(listed[1].font?.data).toEqual(new Uint8Array([0, 1, 2, 3]));
++    expect(listed[1].logo?.dataUrl).toBe(PNG_1PX);
++    expect(listed[1].colors).toEqual({ text: '#fafafa', highlight: '#ff3366' });
++
++    // Editing re-saves under the same id and moves it to the top.
++    await saveBrandKit({ ...listed[1], name: 'A2' }, 300);
++    expect((await listBrandKits()).map(k => k.name)).toEqual(['A2', 'B']);
++
++    await deleteBrandKit(a!.id);
++    expect((await listBrandKits()).map(k => k.name)).toEqual(['B']);
++  });
++
++  it('kits and My Presets stay out of each other', async () => {
++    const preset = await savePreset(presetPayload);
++    await saveBrandKit(kit('Kit', 1));
++
++    expect((await listPresets()).map(p => p.name)).toEqual(['Preset A']);
++    expect((await listBrandKits()).map(k => k.name)).toEqual(['Kit']);
++
++    // deleteBrandKit refuses to touch a non-kit record.
++    await deleteBrandKit(preset!.id);
++    expect(await listPresets()).toHaveLength(1);
++  });
++
++  it('the applied kit persists in the project snapshot and restores after reload', async () => {
++    const k = kit('Studio', 1);
++    const look = {
++      captionTextColor: '#ffffff', accentColor: '#06b6d4', emphasisStyle: {}, templateSlots: {}, textOverrides: {},
++      font: { name: null, data: null, isCustom: false },
++    };
++    const { look: applied, ledger } = remapBrandKit(look, emptyBrandLedger(), mapBrandKit('captik', k).patch);
++    const brandKit: AppliedBrandKit = { kit: k, ledger, mappedFor: brandMapKey('captik'), notes: [], appliedAt: 42 };
++    const snapshot = {
++      words: [], transcript: 'x', srtNative: '', captionStyle: 'captik',
++      captionTextColor: applied.captionTextColor, accentColor: applied.accentColor, brandKit,
++    } as unknown as ProjectSnapshot;
++
++    await saveStoredProject('proj1', { title: 'P', snapshot });
++    const restored = normalizeAppliedBrandKit((await getStoredProject('proj1'))?.snapshot.brandKit);
++    expect(restored).toEqual(brandKit);
++    expect(restored?.kit.font?.data).toEqual(new Uint8Array([0, 1, 2, 3]));
++  });
++});
+diff --git a/src/lib/__tests__/brandLogoSurfaces.spec.ts b/src/lib/__tests__/brandLogoSurfaces.spec.ts
+new file mode 100644
+index 0000000..d34db68
+--- /dev/null
++++ b/src/lib/__tests__/brandLogoSurfaces.spec.ts
+@@ -0,0 +1,65 @@
++import { describe, it, expect } from 'vitest';
++import { readFileSync } from 'node:fs';
++import { join } from 'node:path';
++
++/**
++ * The Brand Kit logo must appear on EVERY surface that paints a frame, through the ONE shared
++ * component, layered like the watermark — mounted before it so the watermark always paints on top.
++ * The failure this guards is the classic one in this codebase: a new export path (or a new props
++ * literal in page.tsx) that forgets the prop, so the preview shows the logo and the file doesn't.
++ * (Rendered-output checks live in the Remotion still renders; this pins the wiring.)
++ */
++const read = (rel: string) => readFileSync(join(process.cwd(), rel), 'utf8');
++
++const SURFACES: { file: string; watermark: string }[] = [
++  { file: 'src/components/editor/VideoCanvas.tsx',       watermark: '<PreviewWatermark' },
++  { file: 'src/remotion/CaptionExportComposition.tsx',   watermark: '<Watermark />' },
++  { file: 'src/remotion/LambdaCaptionComposition.tsx',   watermark: '<Watermark />' },
++  { file: 'src/lib/export/elementCaptureExport.tsx',     watermark: '<WatermarkLockup' },
++];
++
++describe('brand logo overlay — render-surface parity', () => {
++  it.each(SURFACES)('$file mounts the shared BrandLogoOverlay just before its watermark', ({ file, watermark }) => {
++    const src = read(file);
++    expect(src).toMatch(/import \{ BrandLogoOverlay \} from '(?:@\/remotion|\.)\/BrandLogoOverlay'/);
++    const logoAt = src.indexOf('<BrandLogoOverlay');
++    const wmAt = src.indexOf(watermark);
++    expect(logoAt).toBeGreaterThan(-1);
++    expect(wmAt).toBeGreaterThan(logoAt);
++  });
++
++  it.each(['src/remotion/CaptionExportComposition.tsx', 'src/remotion/LambdaCaptionComposition.tsx'])(
++    '%s validates the prop and holds capture until the logo decodes', (file) => {
++      const src = read(file);
++      expect(src).toMatch(/sanitizeBrandLogo\(brandLogo\)/);
++      expect(src).toMatch(/useBrandLogoGate\(/);
++      expect(src).toMatch(/onSettled=\{releaseLogo\}/);
++    });
++
++  it('the logo never gates the watermark: watermark conditions are unchanged', () => {
++    expect(read('src/remotion/CaptionExportComposition.tsx')).toMatch(/\{!isPro && <Watermark \/>\}/);
++    expect(read('src/remotion/LambdaCaptionComposition.tsx')).toMatch(/\{!isPro && auraAlphaLayer !== 'diff' && <Watermark \/>\}/);
++  });
++
++  describe('editor page wires the prop into every export', () => {
++    const page = read('src/app/editor/page.tsx');
++
++    it('every CaptionExportProps literal carries brandLogo', () => {
++      const literals = [...page.matchAll(/: CaptionExportProps = \{([\s\S]*?)\n\s*\};/g)].map(m => m[1]);
++      expect(literals.length).toBeGreaterThanOrEqual(4);
++      for (const body of literals) expect(body).toMatch(/\bbrandLogo\b/);
++    });
++
++    it('the cloud render body carries brandLogo', () => {
++      const body = /const renderBody = \{([\s\S]*?)\n\s*\};/.exec(page)?.[1] ?? '';
++      expect(body).toMatch(/\bbrandLogo\b/);
++    });
++
++    it('the preview gets it, and both canvas-recorder fallbacks draw it', () => {
++      expect(page).toMatch(/<VideoCanvas[\s\S]*?brandLogo=\{brandLogo\}/);
++      const calls = [...page.matchAll(/await recordVideoWithCaptions\(([\s\S]*?)\);/g)].map(m => m[1]);
++      expect(calls.length).toBeGreaterThanOrEqual(2);
++      for (const args of calls) expect(args).toMatch(/\bbrandLogo\b/);
++    });
++  });
++});
+diff --git a/src/lib/brandKit.ts b/src/lib/brandKit.ts
+new file mode 100644
+index 0000000..2cb11fb
+--- /dev/null
++++ b/src/lib/brandKit.ts
+@@ -0,0 +1,798 @@
++// Brand Kit — a creator's reusable identity (up to 4 colours, a font, a logo) applied to a project in
++// one click. This module is the PURE core, unit-tested in __tests__/brandKit.spec.ts:
++//
++//   1. mapBrandKit — which kit colour lands on which colour input of each template
++//      (TEMPLATE_COLOR_RULES), plus the font (skipped for font-locked templates).
++//   2. The ownership ledger — applyBrandPatch / remapBrandKit / removeBrandKitFromLook. A kit is
++//      WRITTEN INTO the editor's existing look state (so preview and every export pick it up exactly
++//      like a manual edit — no new render path), re-mapped when the template changes, and removed
++//      again. Removal restores a field only if it still holds the kit's value, so an edit the
++//      creator made after applying the kit survives "Remove kit".
++//   3. Storage-record, logo-file and validation helpers (brandKitStore.ts does the IndexedDB I/O).
++//
++// A kit only ever writes inputs the templates ALREADY honour: captionTextColor, accentColor,
++// emphasisStyle.hex, the Text-tab background, per-template slot colours and the custom font.
++
++import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
++import { FONT_LOCKED_STYLES } from '@/remotion/KineticCaptionComposition';
++import type { BackgroundConfig, EmphasisStyle, TemplateSlotOverrides, TextOverrides } from '@/types/transcript';
++import { DEFAULT_ACCENT, DEFAULT_CAPTION_TEXT } from '@/lib/captionColors';
++import {
++  BRAND_LOGO_OPACITY, BRAND_LOGO_POSITIONS, BRAND_LOGO_SIZE,
++  isBrandLogoDataUrl, sanitizeBrandLogo,
++  type BrandLogoPosition, type BrandLogoProps,
++} from '@/lib/brandLogo';
++
++// ── Kit model ─────────────────────────────────────────────────────────────────
++
++export type BrandColorRole = 'text' | 'highlight' | 'secondary' | 'box';
++export const BRAND_COLOR_ROLES: readonly BrandColorRole[] = ['text', 'highlight', 'secondary', 'box'];
++export const BRAND_COLOR_ROLE_LABELS: Record<BrandColorRole, string> = {
++  text: 'Text',
++  highlight: 'Highlight',
++  secondary: 'Secondary',
++  box: 'Box',
++};
++
++/** Every role optional — a kit carries "up to 4" colours. Values are #rrggbb. */
++export type BrandKitColors = Partial<Record<BrandColorRole, string>>;
++
++export interface BrandKitFont {
++  /** CSS family name — the same value the Fonts panel selects. */
++  name: string;
++  /** A user upload (as opposed to a built-in / Google font). */
++  isCustom: boolean;
++  /** The font bytes, so the kit applies on any project (and exports embed it) without re-downloading. */
++  data?: Uint8Array;
++}
++
++export interface BrandKitLogo {
++  dataUrl: string;
++  /** Natural width ÷ height. */
++  aspect: number;
++  position: BrandLogoPosition;
++  sizePct: number;
++  opacity: number;
++  fileName?: string;
++}
++
++export interface BrandKit {
++  id: string;
++  name: string;
++  colors: BrandKitColors;
++  font?: BrandKitFont | null;
++  logo?: BrandKitLogo | null;
++  createdAt: number;
++  updatedAt: number;
++}
++
++export const BRAND_KIT_NAME_MAX = 60;
++
++export function createBrandKit(init: Partial<Omit<BrandKit, 'id' | 'createdAt' | 'updatedAt'>> = {}, now = Date.now()): BrandKit {
++  return {
++    id: `bk_${now}_${Math.random().toString(36).slice(2, 8)}`,
++    name: init.name ?? 'My brand kit',
++    colors: init.colors ?? {},
++    font: init.font ?? null,
++    logo: init.logo ?? null,
++    createdAt: now,
++    updatedAt: now,
++  };
++}
++
++// ── Colour helpers ────────────────────────────────────────────────────────────
++
++/** `#abc` / `abc` / `#AABBCC` → `#aabbcc`; anything else → null. */
++export function normalizeHex(v: unknown): string | null {
++  if (typeof v !== 'string') return null;
++  let h = v.trim().toLowerCase();
++  if (!h.startsWith('#')) h = `#${h}`;
++  if (/^#[0-9a-f]{3}$/.test(h)) h = `#${h.slice(1).split('').map(c => c + c).join('')}`;
++  return /^#[0-9a-f]{6}$/.test(h) ? h : null;
++}
++
++function relativeLuminance(hex: string): number {
++  const ch = (i: number) => {
++    const c = parseInt(hex.slice(i, i + 2), 16) / 255;
++    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
++  };
++  return 0.2126 * ch(1) + 0.7152 * ch(3) + 0.0722 * ch(5);
++}
++
++/** WCAG contrast ratio, 1 – 21. Inputs must be #rrggbb. */
++export function contrastRatio(a: string, b: string): number {
++  const la = relativeLuminance(a);
++  const lb = relativeLuminance(b);
++  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
++}
++
++/** WCAG AA for large text — captions are large text. */
++export const MIN_BRAND_CONTRAST = 3;
++
++/**
++ * captionTextColor / accentColor sitting at EXACTLY the editor default read as "not customised"
++ * (captionColors.resolveUserColors), and several templates then show their signature colour instead —
++ * a kit whose text is pure white would silently not apply to Hormozi, Prism, Mr Beast 2 and friends.
++ * Shift the blue channel by 1/255 (imperceptible) so a kit colour always counts as a choice.
++ */
++export function explicitGlobalColor(hex: string, field: 'captionTextColor' | 'accentColor'): string {
++  const def = field === 'captionTextColor' ? DEFAULT_CAPTION_TEXT : DEFAULT_ACCENT;
++  if (hex !== def.toLowerCase()) return hex;
++  const b = parseInt(hex.slice(5, 7), 16);
++  return hex.slice(0, 5) + (b > 0 ? b - 1 : 1).toString(16).padStart(2, '0');
++}
++
++// ── Template colour roles ─────────────────────────────────────────────────────
++
++/** A colour input a template honours. */
++export type BrandColorTarget =
++  | { kind: 'captionTextColor' }                                     // global Text colour
++  | { kind: 'accentColor' }                                          // global Primary / accent
++  | { kind: 'emphasisHex' }                                          // emphasisStyle.hex (hero family)
++  | { kind: 'background'; radius: number; padW: number; padH: number } // Text-tab background, row pill
++  | { kind: 'slot'; field: string };                                  // templateSlots[template][field]
++
++/** What a colour is drawn ON, for the legibility check. */
++export type BrandSurface =
++  | { rule: string; fallback: string }   // the colour an earlier rule resolved to, else the template's own
++  | { role: BrandColorRole }             // the kit's colour for that role (no check when the kit has none)
++  | { fixed: string };                   // a colour the template hardcodes
++
++export interface BrandColorRule {
++  id: string;
++  label: string;
++  target: BrandColorTarget;
++  /** Kit roles to try, in order. The first present (and legible) one wins. */
++  roles: readonly BrandColorRole[];
++  /** Must reach MIN_BRAND_CONTRAST against this surface. */
++  on?: BrandSurface;
++  /** The template's own colour for this input (what shows when the kit leaves it alone). */
++  templateDefault?: string;
++  /**
++   * When the KIT changed the surface and neither a kit colour nor templateDefault is legible on it,
++   * use whichever of black / white reads — e.g. dark text on a kit's dark pill.
++   */
++  legibleFallback?: boolean;
++}
++
++/** Templates whose per-template slot store is keyed differently from nothing (all keys = template id). */
++export const TEMPLATE_SLOT_KEY: Partial<Record<CaptionStyleId, keyof TemplateSlotOverrides>> = {
++  illusion: 'illusion',
++  editor_masala: 'editor_masala',
++  aura: 'aura',
++  aura_helvetica: 'aura_helvetica',
++  scribble: 'scribble',
++  archives: 'archives',
++  blockbuster: 'blockbuster',
++  interlock: 'interlock',
++  journal: 'journal',
++};
++
++/** The colour fields of each slot store (see src/types/transcript.ts + kineticSlots defaults). */
++export const SLOT_COLOR_FIELDS: Record<keyof TemplateSlotOverrides, readonly string[]> = {
++  illusion: ['baseColor', 'emphColor'],
++  editor_masala: ['contextColor', 'heroAColor', 'heroBColor'],
++  aura: ['baseColor', 'accentColor'],
++  aura_helvetica: ['baseColor', 'accentColor'],
++  scribble: ['noteColor', 'markerColor', 'inkColor', 'penColor'],
++  archives: ['inkColor', 'emphColor'],
++  blockbuster: ['redColor', 'scriptColor'],
++  interlock: ['heroColor', 'capsColor'],
++  journal: ['color', 'exitColor'],
++};
++
++const TEXT: BrandColorRule = { id: 'text', label: 'Text', target: { kind: 'captionTextColor' }, roles: ['text'] };
++const TEXT_ONLY: readonly BrandColorRule[] = [TEXT];
++// captik / captik_glow / captik_shadow: small context rows take the text colour, the big emphasised
++// word takes accentColor — and emphasisStyle.hex too, which OVERRIDES the accent on emphasised words,
++// so a leftover emphasis colour from before the kit can't hide the kit's highlight.
++const HERO_RULES: readonly BrandColorRule[] = [
++  TEXT,
++  { id: 'accent', label: 'Big word', target: { kind: 'accentColor' }, roles: ['highlight'] },
++  { id: 'emphasis', label: 'Emphasis', target: { kind: 'emphasisHex' }, roles: ['highlight'] },
++];
++const slotRule = (
++  id: string, label: string, field: string, roles: BrandColorRule['roles'],
++  extra: Partial<BrandColorRule> = {},
++): BrandColorRule => ({ id, label, target: { kind: 'slot', field }, roles, ...extra });
++
++/**
++ * Per template: which kit colour feeds which colour input. Read from the render branches in
++ * CaptionOverlay.tsx — a rule exists only where the branch really reads that input, and a kit never
++ * adds an element a template doesn't have (no pill appears behind Hormozi because the kit has a box
++ * colour). Rules are resolved in order, so a surface rule comes before the rules drawn on it.
++ */
++export const TEMPLATE_COLOR_RULES: Record<CaptionStyleId, readonly BrandColorRule[]> = {
++  captik: HERO_RULES,
++  captik_glow: HERO_RULES,
++  captik_shadow: HERO_RULES,
++
++  // Spoken words sit on a white pill (the row) in black; the pill is recoloured through the Text-tab
++  // background (the same radius/padding the branch hardcodes), and the text must stay readable on it.
++  ali_abdaal: [
++    { id: 'pill', label: 'Pill', target: { kind: 'background', radius: 14, padW: 36, padH: 16 }, roles: ['box'], on: { role: 'text' } },
++    { ...TEXT, on: { rule: 'pill', fallback: '#ffffff' }, templateDefault: '#000000', legibleFallback: true },
++  ],
++  // The spoken word gets a coloured bubble (accentColor) with BLACK text the branch hardcodes.
++  bubble: [
++    { id: 'bubble', label: 'Word bubble', target: { kind: 'accentColor' }, roles: ['box', 'highlight'], on: { fixed: '#000000' } },
++    TEXT,
++  ],
++  // The whole line sits in a coloured box (accentColor) in the text colour.
++  boxed: [
++    { id: 'box', label: 'Box', target: { kind: 'accentColor' }, roles: ['box', 'highlight'], on: { role: 'text' } },
++    { ...TEXT, on: { rule: 'box', fallback: '#f48601' }, templateDefault: '#ffffff', legibleFallback: true },
++  ],
++  highlighted_word: [
++    TEXT,
++    { id: 'accent', label: 'Spoken word', target: { kind: 'accentColor' }, roles: ['highlight'] },
++  ],
++
++  clean_motion: TEXT_ONLY,
++  hormozi: TEXT_ONLY,            // the gradient + shadow are rebuilt from the text colour
++  mrbeast: TEXT_ONLY,
++  mr_beast_2: TEXT_ONLY,
++  iman_gadzhi: TEXT_ONLY,
++  prism: TEXT_ONLY,
++  devin_jatho: TEXT_ONLY,
++  clean_glow: TEXT_ONLY,
++  captik_clean: TEXT_ONLY,
++  captik_word: TEXT_ONLY,
++  pixelated: TEXT_ONLY,
++  liquid_glass: TEXT_ONLY,       // the frosted glass pill IS the template — only the text recolours
++  tabahi: TEXT_ONLY,
++  deep_glow: TEXT_ONLY,          // text colour drives the glow
++  seedha_saadha: TEXT_ONLY,
++  thora_cinematic: TEXT_ONLY,
++  delhi: TEXT_ONLY,
++  big_reveal: TEXT_ONLY,         // the yellow title is hardcoded
++  big_red: TEXT_ONLY,            // the red title gradient is hardcoded
++  black_punch: [],               // black-in-white-outline by design, no colour inputs
++
++  illusion: [
++    slotRule('text', 'Words', 'baseColor', ['text']),
++    slotRule('emph', 'Glitch word', 'emphColor', ['highlight']),
++  ],
++  editor_masala: [
++    slotRule('text', 'Context words', 'contextColor', ['text']),
++    slotRule('heroB', 'Punch word', 'heroBColor', ['highlight']),
++    slotRule('heroA', 'Script word', 'heroAColor', ['secondary']),
++  ],
++  aura: [
++    slotRule('text', 'Words', 'baseColor', ['text']),
++    slotRule('accent', 'Accent', 'accentColor', ['highlight']),
++  ],
++  aura_helvetica: [
++    slotRule('text', 'Words', 'baseColor', ['text']),
++    slotRule('accent', 'Accent', 'accentColor', ['highlight']),
++  ],
++  // The highlighter marker is the highlight; the word ON it needs to read against it.
++  scribble: [
++    slotRule('note', 'Words', 'noteColor', ['text']),
++    slotRule('marker', 'Marker', 'markerColor', ['highlight', 'box']),
++    slotRule('ink', 'Ink on marker', 'inkColor', ['text'], { on: { rule: 'marker', fallback: '#ffe042' }, templateDefault: '#241c12', legibleFallback: true }),
++    slotRule('pen', 'Pen circle', 'penColor', ['secondary']),
++  ],
++  archives: [
++    slotRule('ink', 'Ink', 'inkColor', ['text']),
++    slotRule('emph', 'Emphasis', 'emphColor', ['highlight']),
++  ],
++  blockbuster: [
++    slotRule('red', 'Caps run', 'redColor', ['highlight']),
++    slotRule('script', 'Script', 'scriptColor', ['text']),
++  ],
++  interlock: [
++    slotRule('caps', 'Small words', 'capsColor', ['text']),
++    slotRule('hero', 'Big word', 'heroColor', ['highlight']),
++  ],
++  journal: [
++    slotRule('text', 'Words', 'color', ['text']),
++    slotRule('exit', 'Turns to', 'exitColor', ['secondary', 'highlight']),
++  ],
++};
++
++/** Templates where some colour is part of the design and a kit leaves it alone — shown as a note. */
++export const TEMPLATE_FIXED_COLOUR_NOTES: Partial<Record<CaptionStyleId, string>> = {
++  black_punch: 'Black Punch is black text in a white outline by design, so its colours stay as they are.',
++  big_reveal: 'The big yellow title keeps its colour; the caption under it takes the kit text colour.',
++  big_red: 'The red title keeps its colour; the caption across it takes the kit text colour.',
++};
++
++/** The kit roles a template reads (drives the "Uses" line in the panel). */
++export function rolesUsedByTemplate(styleId: CaptionStyleId): BrandColorRole[] {
++  const used = new Set<BrandColorRole>();
++  for (const r of TEMPLATE_COLOR_RULES[styleId] ?? []) r.roles.forEach(role => used.add(role));
++  return BRAND_COLOR_ROLES.filter(role => used.has(role));
++}
++
++export function isFontLockedTemplate(styleId: string): boolean {
++  return (FONT_LOCKED_STYLES as readonly string[]).includes(styleId);
++}
++
++// ── Look state + patches ──────────────────────────────────────────────────────
++
++export interface BrandFontState {
++  name: string | null;
++  data: Uint8Array | null;
++  isCustom: boolean;
++}
++
++/** The slice of editor state a kit may write. */
++export interface BrandLook {
++  captionTextColor: string;
++  accentColor: string;
++  emphasisStyle: EmphasisStyle;
++  templateSlots: TemplateSlotOverrides;
++  textOverrides: TextOverrides;
++  font: BrandFontState;
++}
++
++export type BrandPatchValue = string | BackgroundConfig | BrandFontState;
++
++/**
++ * Keyed by path: 'captionTextColor' | 'accentColor' | 'emphasisHex' | 'background' | 'font' |
++ * `slot:<template>.<field>`. Slot paths are template-scoped; the rest are global.
++ */
++export type BrandLookPatch = Record<string, BrandPatchValue>;
++
++export type BrandKitNote =
++  | { kind: 'font-locked' }
++  | { kind: 'fixed-colours'; text: string }
++  | { kind: 'legibility'; label: string };
++
++export interface BrandKitMapping {
++  patch: BrandLookPatch;
++  notes: BrandKitNote[];
++}
++
++const isSlotPath = (path: string) => path.startsWith('slot:');
++
++function targetPath(styleId: CaptionStyleId, target: BrandColorTarget): string | null {
++  if (target.kind !== 'slot') return target.kind;
++  const key = TEMPLATE_SLOT_KEY[styleId];
++  return key ? `slot:${key}.${target.field}` : null;
++}
++
++function targetValue(target: BrandColorTarget, hex: string): BrandPatchValue {
++  switch (target.kind) {
++    case 'captionTextColor': return explicitGlobalColor(hex, 'captionTextColor');
++    case 'accentColor':      return explicitGlobalColor(hex, 'accentColor');
++    case 'background':       return { hex, opacity: 100, radius: target.radius, padW: target.padW, padH: target.padH };
++    default:                 return hex;
++  }
++}
++
++/** Resolve one template's colour rules against a kit. */
++export function mapBrandColors(styleId: CaptionStyleId, colors: BrandKitColors | undefined): BrandKitMapping {
++  const kit: BrandKitColors = {};
++  for (const role of BRAND_COLOR_ROLES) {
++    const hex = normalizeHex(colors?.[role]);
++    if (hex) kit[role] = hex;
++  }
++  const patch: BrandLookPatch = {};
++  const notes: BrandKitNote[] = [];
++  const resolved: Record<string, string> = {};
++
++  for (const rule of TEMPLATE_COLOR_RULES[styleId] ?? []) {
++    const path = targetPath(styleId, rule.target);
++    if (!path) continue;
++
++    let surface: string | null = null;
++    let surfaceFromKit = false;
++    if (rule.on && 'rule' in rule.on) {
++      surfaceFromKit = rule.on.rule in resolved;
++      surface = resolved[rule.on.rule] ?? normalizeHex(rule.on.fallback);
++    } else if (rule.on && 'role' in rule.on) {
++      surface = kit[rule.on.role] ?? null;
++      surfaceFromKit = surface !== null;
++    } else if (rule.on && 'fixed' in rule.on) {
++      surface = normalizeHex(rule.on.fixed);
++    }
++
++    let chosen: string | null = null;
++    let blocked = false;
++    for (const role of rule.roles) {
++      const hex = kit[role];
++      if (!hex) continue;
++      if (!surface || contrastRatio(hex, surface) >= MIN_BRAND_CONTRAST) { chosen = hex; break; }
++      blocked = true;
++    }
++    if (!chosen && rule.legibleFallback && surface && surfaceFromKit) {
++      const def = normalizeHex(rule.templateDefault);
++      if (!def || contrastRatio(def, surface) < MIN_BRAND_CONTRAST) {
++        chosen = contrastRatio('#000000', surface) >= contrastRatio('#ffffff', surface) ? '#000000' : '#ffffff';
++      }
++    }
++    if (blocked) notes.push({ kind: 'legibility', label: rule.label });
++    if (!chosen) continue;
++
++    resolved[rule.id] = chosen;
++    patch[path] = targetValue(rule.target, chosen);
++  }
++  return { patch, notes };
++}
++
++/** The font part of a kit for one template. Font-locked templates never take it. */
++export function mapBrandFont(
++  styleId: CaptionStyleId, font: BrandKitFont | null | undefined,
++): { patch?: BrandFontState; note?: BrandKitNote } {
++  if (!font?.name) return {};
++  if (isFontLockedTemplate(styleId)) return { note: { kind: 'font-locked' } };
++  return { patch: { name: font.name, data: font.data ?? null, isCustom: !!font.isCustom } };
++}
++
++/**
++ * The full patch for applying `kit` while `styleId` is the project template. `lineStyleIds` are the
++ * per-caption template overrides in use: their SLOT colours are mapped too (slot stores are per
++ * template, so they never conflict), while the global fields follow the project template.
++ */
++export function mapBrandKit(
++  styleId: CaptionStyleId, kit: Pick<BrandKit, 'colors' | 'font'>, lineStyleIds: readonly string[] = [],
++): BrandKitMapping {
++  const main = mapBrandColors(styleId, kit.colors);
++  const patch: BrandLookPatch = { ...main.patch };
++  for (const other of new Set(lineStyleIds)) {
++    if (other === styleId || !(other in TEMPLATE_COLOR_RULES)) continue;
++    const extra = mapBrandColors(other as CaptionStyleId, kit.colors);
++    for (const [path, value] of Object.entries(extra.patch)) {
++      if (isSlotPath(path) && !(path in patch)) patch[path] = value;
++    }
++  }
++  const notes: BrandKitNote[] = [];
++  const fixed = TEMPLATE_FIXED_COLOUR_NOTES[styleId];
++  if (fixed) notes.push({ kind: 'fixed-colours', text: fixed });
++  notes.push(...main.notes);
++  const font = mapBrandFont(styleId, kit.font);
++  if (font.patch) patch.font = font.patch;
++  if (font.note) notes.push(font.note);
++  return { patch, notes };
++}
++
++/** Identifies the template set a mapping was computed for; a change triggers a re-map. */
++export function brandMapKey(styleId: string, lineStyleIds: readonly string[] = []): string {
++  return `${styleId}|${[...new Set(lineStyleIds)].sort().join(',')}`;
++}
++
++// ── Ownership ledger ──────────────────────────────────────────────────────────
++
++/**
++ * Fields the applied kit currently owns: `written` is what the kit put there, `before` what was
++ * there when the kit first took the field (null = absent). Plain data, persisted in the project
++ * snapshot so "Remove kit" still works after a reload.
++ */
++export interface BrandLedger {
++  before: Record<string, BrandPatchValue | null>;
++  written: Record<string, BrandPatchValue>;
++}
++
++export const emptyBrandLedger = (): BrandLedger => ({ before: {}, written: {} });
++
++const SLOT_PATH = /^slot:([a-z_]+)\.([A-Za-z]+)$/;
++
++export function getBrandPath(look: BrandLook, path: string): BrandPatchValue | null {
++  switch (path) {
++    case 'captionTextColor': return look.captionTextColor;
++    case 'accentColor':      return look.accentColor;
++    case 'emphasisHex':      return look.emphasisStyle.hex ?? null;
++    case 'background':       return look.textOverrides.background ?? null;
++    case 'font':             return look.font.name ? look.font : null;
++  }
++  const m = SLOT_PATH.exec(path);
++  if (!m) return null;
++  const store = (look.templateSlots as Record<string, Record<string, unknown> | undefined>)[m[1]];
++  const v = store?.[m[2]];
++  return typeof v === 'string' ? v : null;
++}
++
++/** Immutable write; `null` removes the value (sparse overrides fall back to the template's own). */
++export function setBrandPath(look: BrandLook, path: string, value: BrandPatchValue | null): BrandLook {
++  switch (path) {
++    case 'captionTextColor':
++      return { ...look, captionTextColor: typeof value === 'string' ? value : DEFAULT_CAPTION_TEXT };
++    case 'accentColor':
++      return { ...look, accentColor: typeof value === 'string' ? value : DEFAULT_ACCENT };
++    case 'emphasisHex': {
++      const next = { ...look.emphasisStyle };
++      if (typeof value === 'string') next.hex = value; else delete next.hex;
++      return { ...look, emphasisStyle: next };
++    }
++    case 'background': {
++      const next = { ...look.textOverrides };
++      if (value && typeof value === 'object' && 'hex' in value) next.background = value; else delete next.background;
++      return { ...look, textOverrides: next };
++    }
++    case 'font':
++      return {
++        ...look,
++        font: value && typeof value === 'object' && 'name' in value && value.name
++          ? { name: value.name, data: value.data ?? null, isCustom: !!value.isCustom }
++          : { name: null, data: null, isCustom: false },
++      };
++  }
++  const m = SLOT_PATH.exec(path);
++  if (!m) return look;
++  const slots = { ...(look.templateSlots as Record<string, Record<string, unknown> | undefined>) };
++  const store = { ...(slots[m[1]] ?? {}) };
++  if (typeof value === 'string') store[m[2]] = value; else delete store[m[2]];
++  if (Object.keys(store).length) slots[m[1]] = store; else delete slots[m[1]];
++  return { ...look, templateSlots: slots as TemplateSlotOverrides };
++}
++
++function deepEqual(a: unknown, b: unknown): boolean {
++  if (a === b) return true;
++  if (typeof a !== 'object' || typeof b !== 'object' || !a || !b) return false;
++  const ka = Object.keys(a as object).filter(k => (a as Record<string, unknown>)[k] !== undefined);
++  const kb = Object.keys(b as object).filter(k => (b as Record<string, unknown>)[k] !== undefined);
++  if (ka.length !== kb.length) return false;
++  return ka.every(k => deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
++}
++
++/** Does the look still hold what the kit wrote? Colours compare case-insensitively, fonts by name. */
++export function sameBrandValue(current: BrandPatchValue | null, written: BrandPatchValue | null): boolean {
++  if (current === null || written === null) return current === written;
++  if (typeof current === 'string' || typeof written === 'string') {
++    return typeof current === 'string' && typeof written === 'string' && current.toLowerCase() === written.toLowerCase();
++  }
++  if ('name' in current || 'name' in written) {
++    return 'name' in current && 'name' in written && current.name === written.name && !!current.isCustom === !!written.isCustom;
++  }
++  return deepEqual({ ...current, hex: current.hex.toLowerCase() }, { ...written, hex: written.hex.toLowerCase() });
++}
++
++/** Font bytes live in the kit already — the ledger's `written` stamp only needs the identity. */
++const writtenStamp = (path: string, value: BrandPatchValue): BrandPatchValue =>
++  path === 'font' && typeof value === 'object' && 'name' in value
++    ? { name: value.name, data: null, isCustom: value.isCustom }
++    : value;
++
++/** Write a patch, taking ownership of each field (recording its prior value the first time). */
++export function applyBrandPatch(
++  look: BrandLook, patch: BrandLookPatch, ledger: BrandLedger = emptyBrandLedger(),
++): { look: BrandLook; ledger: BrandLedger } {
++  let next = look;
++  const out: BrandLedger = { before: { ...ledger.before }, written: { ...ledger.written } };
++  for (const [path, value] of Object.entries(patch)) {
++    if (!Object.prototype.hasOwnProperty.call(out.written, path)) out.before[path] = getBrandPath(look, path);
++    next = setBrandPath(next, path, value);
++    out.written[path] = writtenStamp(path, value);
++  }
++  return { look: next, ledger: out };
++}
++
++/**
++ * Re-map an applied kit onto a new template set (or apply it fresh, with an empty ledger):
++ *   · a global field the new mapping no longer uses is handed back — restored if it still holds the
++ *     kit's value (so a text colour meant for Ali Abdaal's pill, or a font a font-locked template
++ *     won't take, doesn't linger), released as-is if something else changed it since;
++ *   · a field the new mapping uses but that changed since the kit wrote it (a template switch
++ *     reset it, a preset replaced it) re-records its prior value, so removal returns to THAT;
++ *   · slot fields of templates no longer on screen stay owned — they're template-scoped and harmless,
++ *     and removal can still restore them.
++ */
++export function remapBrandKit(
++  look: BrandLook, ledger: BrandLedger, patch: BrandLookPatch,
++): { look: BrandLook; ledger: BrandLedger } {
++  let cur = look;
++  const next: BrandLedger = { before: { ...ledger.before }, written: { ...ledger.written } };
++  for (const path of Object.keys(next.written)) {
++    const unchanged = sameBrandValue(getBrandPath(cur, path), next.written[path]);
++    if (path in patch) {
++      if (unchanged) continue;
++    } else if (isSlotPath(path)) {
++      continue;
++    } else if (unchanged) {
++      cur = setBrandPath(cur, path, next.before[path] ?? null);
++    }
++    delete next.written[path];
++    delete next.before[path];
++  }
++  return applyBrandPatch(cur, patch, next);
++}
++
++/** "Remove kit": hand every owned field back, restoring those that still hold the kit's value. */
++export function removeBrandKitFromLook(look: BrandLook, ledger: BrandLedger): BrandLook {
++  let cur = look;
++  for (const [path, written] of Object.entries(ledger.written)) {
++    if (sameBrandValue(getBrandPath(cur, path), written)) cur = setBrandPath(cur, path, ledger.before[path] ?? null);
++  }
++  return cur;
++}
++
++/**
++ * The editor remembers each template's Text/Primary colours across template switches. Those memories
++ * must hold the creator's OWN colours, not the kit's, or removing the kit and switching back would
++ * resurrect kit colours. Swap any kit-written value for what it replaced.
++ */
++export function withoutBrandColors<T extends { accentColor: string; captionTextColor: string }>(
++  colors: T, ledger: BrandLedger | null | undefined,
++): T {
++  if (!ledger) return colors;
++  const out = { ...colors };
++  for (const field of ['accentColor', 'captionTextColor'] as const) {
++    const written = ledger.written[field];
++    if (written !== undefined && sameBrandValue(colors[field], written)) {
++      const before = ledger.before[field];
++      out[field] = typeof before === 'string' ? before : (field === 'accentColor' ? DEFAULT_ACCENT : DEFAULT_CAPTION_TEXT);
++    }
++  }
++  return out;
++}
++
++// ── Applied state (persisted in the project snapshot) ─────────────────────────
++
++export interface AppliedBrandKit {
++  /** A full copy — the project keeps its kit (logo, font bytes) even if the library kit is deleted. */
++  kit: BrandKit;
++  ledger: BrandLedger;
++  /** brandMapKey of the template set the ledger was last mapped for. */
++  mappedFor: string;
++  notes: BrandKitNote[];
++  appliedAt: number;
++}
++
++// ── Validation / normalisation (persisted data is untyped at runtime) ─────────
++
++const finiteOr = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
++const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
++
++export function normalizeBrandKit(input: unknown): BrandKit | null {
++  if (!input || typeof input !== 'object') return null;
++  const o = input as Record<string, unknown>;
++  if (typeof o.id !== 'string' || !o.id) return null;
++
++  const colors: BrandKitColors = {};
++  const rawColors = (o.colors && typeof o.colors === 'object') ? o.colors as Record<string, unknown> : {};
++  for (const role of BRAND_COLOR_ROLES) {
++    const hex = normalizeHex(rawColors[role]);
++    if (hex) colors[role] = hex;
++  }
++
++  let font: BrandKitFont | null = null;
++  if (o.font && typeof o.font === 'object') {
++    const f = o.font as Record<string, unknown>;
++    if (typeof f.name === 'string' && f.name.trim()) {
++      font = { name: f.name.trim(), isCustom: !!f.isCustom };
++      if (f.data instanceof Uint8Array && f.data.byteLength > 0) font.data = f.data;
++    }
++  }
++
++  let logo: BrandKitLogo | null = null;
++  if (o.logo && typeof o.logo === 'object') {
++    const l = o.logo as Record<string, unknown>;
++    if (isBrandLogoDataUrl(l.dataUrl)) {
++      logo = {
++        dataUrl: l.dataUrl,
++        aspect: clamp(finiteOr(l.aspect, 1), 0.05, 20),
++        position: BRAND_LOGO_POSITIONS.includes(l.position as BrandLogoPosition) ? l.position as BrandLogoPosition : 'top-right',
++        sizePct: clamp(finiteOr(l.sizePct, BRAND_LOGO_SIZE.default), BRAND_LOGO_SIZE.min, BRAND_LOGO_SIZE.max),
++        opacity: clamp(finiteOr(l.opacity, BRAND_LOGO_OPACITY.default), BRAND_LOGO_OPACITY.min, BRAND_LOGO_OPACITY.max),
++      };
++      if (typeof l.fileName === 'string') logo.fileName = l.fileName.slice(0, 200);
++    }
++  }
++
++  const name = (typeof o.name === 'string' ? o.name.trim() : '').slice(0, BRAND_KIT_NAME_MAX) || 'My brand kit';
++  const createdAt = finiteOr(o.createdAt, 0);
++  return { id: o.id, name, colors, font, logo, createdAt, updatedAt: finiteOr(o.updatedAt, createdAt) };
++}
++
++export function normalizeAppliedBrandKit(input: unknown): AppliedBrandKit | null {
++  if (!input || typeof input !== 'object') return null;
++  const o = input as Record<string, unknown>;
++  const kit = normalizeBrandKit(o.kit);
++  if (!kit) return null;
++  const l = (o.ledger && typeof o.ledger === 'object') ? o.ledger as Record<string, unknown> : {};
++  const plain = (v: unknown) => (v && typeof v === 'object' && !Array.isArray(v) ? { ...(v as Record<string, never>) } : {});
++  const notes = Array.isArray(o.notes)
++    ? (o.notes as unknown[]).filter((n): n is BrandKitNote => !!n && typeof n === 'object' && typeof (n as { kind?: unknown }).kind === 'string')
++    : [];
++  return {
++    kit,
++    ledger: { before: plain(l.before), written: plain(l.written) },
++    mappedFor: typeof o.mappedFor === 'string' ? o.mappedFor : '',
++    notes,
++    appliedAt: finiteOr(o.appliedAt, 0),
++  };
++}
++
++/** The render prop for the preview + every exporter, or undefined when the kit has no (valid) logo. */
++export function brandLogoFromKit(kit: BrandKit | null | undefined): BrandLogoProps | undefined {
++  const l = kit?.logo;
++  if (!l) return undefined;
++  return sanitizeBrandLogo({ src: l.dataUrl, aspect: l.aspect, position: l.position, sizePct: l.sizePct, opacity: l.opacity }) ?? undefined;
++}
++
++// ── Logo files ────────────────────────────────────────────────────────────────
++
++export const BRAND_LOGO_MAX_BYTES = 1024 * 1024;
++const LOGO_TYPES: Record<string, string> = {
++  'image/png': 'png', 'image/jpeg': 'jpeg', 'image/webp': 'webp', 'image/svg+xml': 'svg+xml',
++};
++const LOGO_EXTS: Record<string, string> = {
++  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', svg: 'image/svg+xml',
++};
++
++/** The image MIME type for an upload (browsers report '' for some files, e.g. SVG on Windows). */
++export function brandLogoMime(file: { name?: string; type?: string }): string | null {
++  if (file.type && LOGO_TYPES[file.type]) return file.type;
++  if (file.type) return null;
++  const ext = (file.name ?? '').split('.').pop()?.toLowerCase() ?? '';
++  return LOGO_EXTS[ext] ?? null;
++}
++
++/** A user-facing error for an unusable logo file, or null. */
++export function validateBrandLogoFile(file: { name?: string; type?: string; size: number }): string | null {
++  if (!brandLogoMime(file)) return 'Logo must be a PNG, JPG, WebP or SVG image.';
++  if (file.size <= 0) return 'That file is empty.';
++  if (file.size > BRAND_LOGO_MAX_BYTES) return 'Logo must be 1 MB or smaller.';
++  return null;
++}
++
++/** Intrinsic size of an SVG from its width/height attributes, else its viewBox. */
++export function svgIntrinsicSize(svg: string): { w: number; h: number } | null {
++  const tag = /<svg\b[^>]*>/i.exec(svg)?.[0];
++  if (!tag) return null;
++  const attr = (name: string) => {
++    const m = new RegExp(`\\s${name}\\s*=\\s*["']\\s*([\\d.]+)\\s*(px)?\\s*["']`, 'i').exec(tag);
++    return m ? parseFloat(m[1]) : NaN;
++  };
++  const w = attr('width');
++  const h = attr('height');
++  if (w > 0 && h > 0) return { w, h };
++  const vb = /viewBox\s*=\s*["']\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)/i.exec(tag);
++  if (vb) {
++    const vw = parseFloat(vb[1]);
++    const vh = parseFloat(vb[2]);
++    if (vw > 0 && vh > 0) return { w: vw, h: vh };
++  }
++  return null;
++}
++
++// ── Storage records (the IndexedDB `presets` store) ───────────────────────────
++
++export const BRAND_KIT_RECORD_KIND = 'brandKit';
++
++/**
++ * Kits share the `presets` object store with My Presets (no DB_VER bump — see openCaptikDB), told
++ * apart by `kind`. listPresets filters them out. A tab still running the PREVIOUS build doesn't know
++ * that filter and lists every record as a preset; so a kit record also carries the StylePreset
++ * fields, and clicking it in such a tab applies a sensible look instead of crashing the editor on
++ * an undefined captionBox / accentColor.
++ */
++export interface BrandKitRecord {
++  id: string;
++  kind: typeof BRAND_KIT_RECORD_KIND;
++  name: string;
++  savedAt: number;
++  kit: BrandKit;
++  styleId: 'hormozi';
++  accentColor: string;
++  captionTextColor: string;
++  captionBox: { xPercent: number; yPercent: number; widthPercent: number };
++  captionFontScale: number;
++  captionLines: 'single';
++}
++
++export function toBrandKitRecord(kit: BrandKit): BrandKitRecord {
++  return {
++    id: kit.id,
++    kind: BRAND_KIT_RECORD_KIND,
++    name: kit.name,
++    savedAt: kit.updatedAt,
++    kit,
++    styleId: 'hormozi',
++    accentColor: kit.colors.highlight ?? DEFAULT_ACCENT,
++    captionTextColor: kit.colors.text ?? DEFAULT_CAPTION_TEXT,
++    captionBox: { xPercent: 50, yPercent: 85, widthPercent: 84 },
++    captionFontScale: 1,
++    captionLines: 'single',
++  };
++}
++
++export function isBrandKitRecord(rec: unknown): rec is BrandKitRecord {
++  return !!rec && typeof rec === 'object' && (rec as { kind?: unknown }).kind === BRAND_KIT_RECORD_KIND;
++}
++
++export function fromBrandKitRecord(rec: unknown): BrandKit | null {
++  return isBrandKitRecord(rec) ? normalizeBrandKit(rec.kit) : null;
++}
+diff --git a/src/lib/brandKitStore.ts b/src/lib/brandKitStore.ts
+new file mode 100644
+index 0000000..e291ee2
+--- /dev/null
++++ b/src/lib/brandKitStore.ts
+@@ -0,0 +1,59 @@
++'use client';
++
++// IndexedDB persistence for Brand Kits — local-only, like My Presets.
++//
++// Kits live in the EXISTING `presets` object store of the `captik` database, tagged with
++// kind:'brandKit' (see toBrandKitRecord in lib/brandKit.ts for why the record also carries
++// preset-shaped fields). No new store and no DB_VER bump: a version upgrade is blocked for as long
++// as another tab holds the database open, which once froze transcription (see openCaptikDB).
++
++import { openCaptikDB } from '@/lib/projectStore';
++import { fromBrandKitRecord, isBrandKitRecord, toBrandKitRecord, type BrandKit } from '@/lib/brandKit';
++
++const STORE = 'presets';
++
++function run<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest): Promise<T> {
++  return openCaptikDB().then(db => new Promise<T>((resolve, reject) => {
++    // Close on every outcome — a connection left open blocks a DB_VER upgrade in another tab.
++    const close = () => { try { db.close(); } catch { /* already gone */ } };
++    const t = db.transaction(STORE, mode);
++    const req = fn(t.objectStore(STORE));
++    req.onsuccess = () => resolve(req.result as T);
++    req.onerror = () => { close(); reject(req.error); };
++    t.onabort = () => { close(); reject(t.error); };
++    t.oncomplete = close;
++  }));
++}
++
++/** Every saved kit, most recently edited first. Never throws. */
++export async function listBrandKits(): Promise<BrandKit[]> {
++  try {
++    const all = (await run<unknown[]>('readonly', s => s.getAll())) ?? [];
++    return all
++      .filter(isBrandKitRecord)
++      .map(fromBrandKitRecord)
++      .filter((k): k is BrandKit => k !== null)
++      .sort((a, b) => b.updatedAt - a.updatedAt);
++  } catch {
++    return [];
++  }
++}
++
++/** Insert or update. Returns the stored kit (with a fresh updatedAt), or null if storage refused it. */
++export async function saveBrandKit(kit: BrandKit, now = Date.now()): Promise<BrandKit | null> {
++  const stored: BrandKit = { ...kit, createdAt: kit.createdAt || now, updatedAt: now };
++  try {
++    await run('readwrite', s => s.put(toBrandKitRecord(stored)));
++    return stored;
++  } catch {
++    return null;
++  }
++}
++
++export async function deleteBrandKit(id: string): Promise<void> {
++  try {
++    // Only ever delete a kit record — never a My Presets entry that happens to share an id.
++    const existing = await run<unknown>('readonly', s => s.get(id));
++    if (isBrandKitRecord(existing)) await run('readwrite', s => s.delete(id));
++  } catch { /* best effort */ }
++}
+diff --git a/src/lib/brandLogo.ts b/src/lib/brandLogo.ts
+new file mode 100644
+index 0000000..e00f01c
+--- /dev/null
++++ b/src/lib/brandLogo.ts
+@@ -0,0 +1,103 @@
++// Brand Kit logo overlay — the render contract shared by EVERY surface that paints a frame:
++//   · live preview              → src/components/editor/VideoCanvas.tsx
++//   · in-browser WebCodecs      → src/remotion/CaptionExportComposition.tsx
++//   · cloud (Lambda / box)      → src/remotion/LambdaCaptionComposition.tsx
++//   · Element Capture           → src/lib/export/elementCaptureExport.tsx
++//   · canvas-recorder fallback  → recordVideoWithCaptions (src/app/editor/page.tsx)
++// The DOM surfaces all mount ONE component, src/remotion/BrandLogoOverlay.tsx; the canvas fallback
++// draws with brandLogoBox below. Geometry is computed in frame pixels from the frame WIDTH, so a
++// 270px-wide preview and a 1080px-wide export put the logo on proportionally identical pixels.
++//
++// Pure and dependency-free on purpose: it is bundled into the Remotion site.
++
++export type BrandLogoPosition = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
++
++export const BRAND_LOGO_POSITIONS: readonly BrandLogoPosition[] = ['top-left', 'top-right', 'bottom-left', 'bottom-right'];
++
++/** What a render surface receives. Built from the applied kit by brandLogoFromKit (lib/brandKit). */
++export interface BrandLogoProps {
++  /** data: URL of a PNG / JPEG / WebP / SVG image — never a remote URL (see sanitizeBrandLogo). */
++  src: string;
++  /** Natural width ÷ height, measured when the logo was uploaded. */
++  aspect: number;
++  position: BrandLogoPosition;
++  /** Logo width as a percentage of the frame width. */
++  sizePct: number;
++  /** 0.1 – 1. */
++  opacity: number;
++}
++
++export const BRAND_LOGO_SIZE = { min: 5, max: 40, default: 16 } as const;
++export const BRAND_LOGO_OPACITY = { min: 0.1, max: 1, default: 0.9 } as const;
++/** Inset from the two nearest frame edges, as a fraction of the frame WIDTH (same px on both axes). */
++export const BRAND_LOGO_MARGIN_FRAC = 0.04;
++/** A very tall logo is capped at this fraction of the frame height (its width shrinks to match). */
++export const BRAND_LOGO_MAX_HEIGHT_FRAC = 0.4;
++/** A 1 MB file is ~1.37M base64 characters; the headroom covers an SVG rasterised to PNG. */
++export const BRAND_LOGO_MAX_SRC_CHARS = 1_600_000;
++
++const LOGO_DATA_URL = /^data:image\/(?:png|jpeg|webp|svg\+xml);base64,[A-Za-z0-9+/]*={0,2}$/;
++
++const finiteOr = (v: unknown, fallback: number): number =>
++  typeof v === 'number' && Number.isFinite(v) ? v : fallback;
++const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
++
++/** True for an inline base64 image data URL of an allowed type and size. */
++export function isBrandLogoDataUrl(src: unknown): src is string {
++  return typeof src === 'string' && src.length <= BRAND_LOGO_MAX_SRC_CHARS && LOGO_DATA_URL.test(src);
++}
++
++/**
++ * Validate a logo prop that arrived from outside the type system — the cloud route forwards the
++ * client's JSON body into the Lambda inputProps verbatim. Anything malformed returns null (the
++ * frame simply renders without a logo; a bad logo must never fail an export), and the src must be
++ * an inline data URL so a crafted body can't make the renderer fetch an arbitrary URL.
++ */
++export function sanitizeBrandLogo(input: unknown): BrandLogoProps | null {
++  if (!input || typeof input !== 'object') return null;
++  const o = input as Record<string, unknown>;
++  if (!isBrandLogoDataUrl(o.src)) return null;
++  const position = BRAND_LOGO_POSITIONS.includes(o.position as BrandLogoPosition)
++    ? (o.position as BrandLogoPosition)
++    : 'top-right';
++  return {
++    src: o.src,
++    aspect: clamp(finiteOr(o.aspect, 1), 0.05, 20),
++    position,
++    sizePct: clamp(finiteOr(o.sizePct, BRAND_LOGO_SIZE.default), BRAND_LOGO_SIZE.min, BRAND_LOGO_SIZE.max),
++    opacity: clamp(finiteOr(o.opacity, BRAND_LOGO_OPACITY.default), BRAND_LOGO_OPACITY.min, BRAND_LOGO_OPACITY.max),
++  };
++}
++
++export interface BrandLogoBox {
++  /** Top-left corner and size, in frame pixels. */
++  x: number;
++  y: number;
++  width: number;
++  height: number;
++}
++
++/** Where the logo sits in a frame of the given size. The single source of logo geometry. */
++export function brandLogoBox(
++  frameWidth: number,
++  frameHeight: number,
++  logo: Pick<BrandLogoProps, 'aspect' | 'position' | 'sizePct'>,
++): BrandLogoBox {
++  const fw = Math.max(1, frameWidth);
++  const fh = Math.max(1, frameHeight);
++  const aspect = clamp(finiteOr(logo.aspect, 1), 0.05, 20);
++  const sizePct = clamp(finiteOr(logo.sizePct, BRAND_LOGO_SIZE.default), BRAND_LOGO_SIZE.min, BRAND_LOGO_SIZE.max);
++  let width = (fw * sizePct) / 100;
++  let height = width / aspect;
++  const maxHeight = fh * BRAND_LOGO_MAX_HEIGHT_FRAC;
++  if (height > maxHeight) { height = maxHeight; width = height * aspect; }
++  const margin = fw * BRAND_LOGO_MARGIN_FRAC;
++  const left = logo.position === 'top-left' || logo.position === 'bottom-left';
++  const top = logo.position === 'top-left' || logo.position === 'top-right';
++  return {
++    x: left ? margin : fw - margin - width,
++    y: top ? margin : fh - margin - height,
++    width,
++    height,
++  };
++}
+diff --git a/src/lib/export/elementCaptureExport.tsx b/src/lib/export/elementCaptureExport.tsx
+index 6bd8416..17036c5 100644
+--- a/src/lib/export/elementCaptureExport.tsx
++++ b/src/lib/export/elementCaptureExport.tsx
+@@ -25,6 +25,8 @@ import { FFmpeg } from '@ffmpeg/ffmpeg';
+ import { toBlobURL, fetchFile } from '@ffmpeg/util';
+ import { CaptionOverlay } from '@/components/editor/CaptionOverlay';
+ import { WatermarkLockup } from '@/remotion/WatermarkLockup';
++import { BrandLogoOverlay } from '@/remotion/BrandLogoOverlay';
++import { sanitizeBrandLogo } from '@/lib/brandLogo';
+ import { buildFontsCss, buildIndicFontsCss, buildCustomFontCss } from '@/remotion/KineticCaptionComposition';
+ import { mergeTemplateSlots } from '@/lib/kineticSlots';
+ import { fontFamiliesFromCss } from '@/lib/fontFamilies';
+@@ -70,7 +72,8 @@ function ECStage(props: CaptionExportProps & { exW: number; exH: number; onReady
+     captionEmphBox = { xPercent: 50, yPercent: 24, widthPercent: 84 }, segmentEmphBoxOverrides = {},
+     emphFontScale = 1, segmentEmphFontScaleOverrides = {},
+     captionGapMs = 0, customFontName, customFontDataUrl, textOverrides, emphasisStyle, layoutMode,
+-    lineTextOverrides, templateSlots, lineSlotOverrides } = props;
++    lineTextOverrides, templateSlots, lineSlotOverrides, brandLogo } = props;
++  const logo = sanitizeBrandLogo(brandLogo);
+ 
+   const [ms, setMs] = useState(0);
+   const rootRef = useRef<HTMLDivElement>(null);
+@@ -129,6 +132,9 @@ function ECStage(props: CaptionExportProps & { exW: number; exH: number; onReady
+             captionFontScale={effFontScale} captionLines={captionLines} captionTextColor={captionTextColor}
+             captionGapMs={captionGapMs} canvasWidthPx={logicalW} textOverrides={effOverrides}
+             emphasisStyle={emphasisStyle} layoutMode={layoutMode} templateSlots={effTemplateSlots} />
++          {/* Brand Kit logo — in the logical layer like the preview, just before the watermark so the
++              watermark stays on top. */}
++          {logo && <BrandLogoOverlay logo={logo} frameWidth={logicalW} frameHeight={logicalH} />}
+           {!isPro && <WatermarkLockup t={ms / 1000} sz={(n: number) => Math.round(n * RS)} gradId="captik-wm-ec" />}
+         </div>
+         {/* "Behind the subject" is NOT drawn in the DOM here — the cut-out is composited directly
+@@ -226,6 +232,12 @@ export async function exportViaElementCapture(opts: ElementCaptureOpts): Promise
+       ]));
+       await document.fonts.ready.catch(() => {});
+     }
++    // Brand Kit logo: decode the stage's own <img> before frame 0 so no captured frame lacks it.
++    // Capped — a logo that never decodes must not strand the export behind the cover.
++    const logoImg = ctl.rootEl.querySelector<HTMLImageElement>('img[data-brand-logo]');
++    if (logoImg && typeof logoImg.decode === 'function') {
++      await Promise.race([logoImg.decode().catch(() => {}), new Promise((r) => setTimeout(r, 10_000))]);
++    }
+ 
+     // capture only the stage element
+     stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 60 }, preferCurrentTab: true } as DisplayMediaStreamOptions);
+diff --git a/src/lib/presetStore.ts b/src/lib/presetStore.ts
+index ca926f0..476f2f8 100644
+--- a/src/lib/presetStore.ts
++++ b/src/lib/presetStore.ts
+@@ -7,6 +7,7 @@
+ import type { TextOverrides, EmphasisStyle, LayoutMode, CaptionBoxConfig, TemplateSlotOverrides } from '@/types/transcript';
+ import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
+ import { openCaptikDB } from '@/lib/projectStore';
++import { isBrandKitRecord } from '@/lib/brandKit';
+ 
+ export interface StylePreset {
+   id: string;
+@@ -49,7 +50,8 @@ function run<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequ
+ export async function listPresets(): Promise<StylePreset[]> {
+   try {
+     const all = (await run<StylePreset[]>('readonly', s => s.getAll())) ?? [];
+-    return all.sort((a, b) => b.savedAt - a.savedAt);
++    // Brand Kits share this store (kind:'brandKit', see brandKitStore.ts) — they are not presets.
++    return all.filter(p => !isBrandKitRecord(p)).sort((a, b) => b.savedAt - a.savedAt);
+   } catch { return []; }
+ }
+ 
+diff --git a/src/lib/projectStore.ts b/src/lib/projectStore.ts
+index c3faaa0..eb84809 100644
+--- a/src/lib/projectStore.ts
++++ b/src/lib/projectStore.ts
+@@ -16,6 +16,7 @@ import type {
+ } from '@/types/transcript';
+ import type { CaptionStyleId } from '@/remotion/KineticCaptionComposition';
+ import type { BleepRange } from '@/lib/profanity';
++import type { AppliedBrandKit } from '@/lib/brandKit';
+ 
+ // Everything needed to rehydrate the editor for a transcribed project.
+ export interface ProjectSnapshot {
+@@ -68,6 +69,10 @@ export interface ProjectSnapshot {
+   lineOverrides?:       Record<string, LineOverride>;
+   /** Global per-template slot overrides (editor_masala/illusion/aura). */
+   templateSlots?:       TemplateSlotOverrides;
++  /** The Brand Kit applied to this project: a full copy of the kit (logo + font bytes) plus the
++      ownership ledger "Remove kit" restores from. The colours/font it wrote are already in the
++      fields above; this restores the logo overlay and removability. Optional — older snapshots. */
++  brandKit?:            AppliedBrandKit;
+ }
+ 
+ /** Lift legacy per-segment style/box overrides into the unified lineOverrides map.
+diff --git a/src/remotion/BrandLogoOverlay.tsx b/src/remotion/BrandLogoOverlay.tsx
+new file mode 100644
+index 0000000..6fa1ab4
+--- /dev/null
++++ b/src/remotion/BrandLogoOverlay.tsx
+@@ -0,0 +1,76 @@
++import { useEffect, useRef, type CSSProperties } from 'react';
++import { brandLogoBox, type BrandLogoProps } from '../lib/brandLogo';
++
++/**
++ * The Brand Kit logo, drawn by EVERY render surface through this one component:
++ *   · preview                → src/components/editor/VideoCanvas.tsx
++ *   · WebCodecs export       → src/remotion/CaptionExportComposition.tsx
++ *   · cloud (Lambda) export  → src/remotion/LambdaCaptionComposition.tsx
++ *   · Element Capture export → src/lib/export/elementCaptureExport.tsx
++ * Each surface mounts it directly BEFORE its free-tier watermark, so the watermark always paints on
++ * top — the logo can never cover or replace it.
++ *
++ * A plain <img> of an inline data URL: the preview, Lambda's Chromium and the web-renderer's
++ * html-in-canvas all rasterise HTMLImageElement (inline SVG is the thing web-renderer can't do, which
++ * is why uploaded SVG logos are converted to PNG before they are stored). No Remotion imports, so the
++ * live editor can mount it too; the compositions gate frame capture on `onSettled`.
++ */
++export function BrandLogoOverlay({ logo, frameWidth, frameHeight, onSettled }: {
++  logo: BrandLogoProps;
++  /** Width/height of the element the logo is positioned in, in that element's own pixels. */
++  frameWidth: number;
++  frameHeight: number;
++  /** Called once the image has decoded (or failed to) — export surfaces hold capture until then. */
++  onSettled?: () => void;
++}) {
++  const ref = useRef<HTMLImageElement>(null);
++
++  // A cached data URL can finish loading before React attaches onLoad — settle from here too.
++  // (The gate on the other end is idempotent, so settling twice is harmless.)
++  useEffect(() => {
++    const el = ref.current;
++    if (!onSettled || !el?.complete) return;
++    const done = () => onSettled();
++    if (typeof el.decode === 'function') el.decode().then(done, done);
++    else done();
++  }, [logo.src, onSettled]);
++
++  const box = brandLogoBox(frameWidth, frameHeight, logo);
++  const style: CSSProperties = {
++    position: 'absolute',
++    left: box.x,
++    top: box.y,
++    width: box.width,
++    height: box.height,
++    opacity: logo.opacity,
++    objectFit: 'contain',
++    display: 'block',
++    // The editor's CSS reset sets img { max-width:100%; height:auto } — pin the computed box.
++    maxWidth: 'none',
++    maxHeight: 'none',
++    pointerEvents: 'none',
++    userSelect: 'none',
++  };
++
++  const handleSettled = (el: HTMLImageElement) => {
++    if (!onSettled) return;
++    const done = () => onSettled();
++    if (typeof el.decode === 'function') el.decode().then(done, done);
++    else done();
++  };
++
++  return (
++    // eslint-disable-next-line @next/next/no-img-element -- inline data URL painted identically by the preview and every exporter; next/image can't render inside Remotion
++    <img
++      ref={ref}
++      data-brand-logo=""
++      src={logo.src}
++      alt=""
++      aria-hidden="true"
++      draggable={false}
++      style={style}
++      onLoad={(e) => handleSettled(e.currentTarget)}
++      onError={() => onSettled?.()}
++    />
++  );
++}
+diff --git a/src/remotion/CaptionExportComposition.tsx b/src/remotion/CaptionExportComposition.tsx
+index 4e78ec9..6c95340 100644
+--- a/src/remotion/CaptionExportComposition.tsx
++++ b/src/remotion/CaptionExportComposition.tsx
+@@ -1,6 +1,6 @@
+ 'use client';
+ 
+-import { useEffect, useState } from 'react';
++import { useEffect, useMemo, useState } from 'react';
+ import {
+   AbsoluteFill, continueRender, delayRender,
+   useCurrentFrame, useVideoConfig,
+@@ -15,6 +15,9 @@ import { CaptionOverlay } from '../components/editor/CaptionOverlay';
+ import { mergeTemplateSlots } from '../lib/kineticSlots';
+ import { fontFamiliesFromCss, referencedFontFamilies } from '../lib/fontFamilies';
+ import { logicalCanvasSize } from '../lib/aspect';
++import { sanitizeBrandLogo, type BrandLogoProps } from '../lib/brandLogo';
++import { BrandLogoOverlay } from './BrandLogoOverlay';
++import { useBrandLogoGate } from './useBrandLogoGate';
+ import {
+   buildFontsCss, buildIndicFontsCss, buildCustomFontCss, Watermark,
+   type CaptionStyleId,
+@@ -65,6 +68,8 @@ export interface CaptionExportProps {
+   /** Per-template slot overrides (editor_masala/illusion/aura) — global + per-line. */
+   templateSlots?:         TemplateSlotOverrides;
+   lineSlotOverrides?:     Record<string, TemplateSlotOverrides>;
++  /** Brand Kit logo overlay — drawn by the shared BrandLogoOverlay beneath the watermark. */
++  brandLogo?:             BrandLogoProps;
+ }
+ 
+ export function CaptionExportComposition({
+@@ -78,12 +83,16 @@ export function CaptionExportComposition({
+   captionFontScale = 1.0, captionLines = 'single', captionGapMs = 0,
+   noVideo = false, customFontName, customFontDataUrl,
+   textOverrides, emphasisStyle, layoutMode, lineTextOverrides,
+-  templateSlots, lineSlotOverrides,
++  templateSlots, lineSlotOverrides, brandLogo,
+ }: CaptionExportProps) {
+   const frame = useCurrentFrame();
+   const { fps, width, height } = useVideoConfig();
+   const currentMs = (frame / fps) * 1000;
+ 
++  // Brand Kit logo — validated, and frame capture held until it has decoded (see LambdaCaptionComposition).
++  const logo = useMemo(() => sanitizeBrandLogo(brandLogo), [brandLogo]);
++  const releaseLogo = useBrandLogoGate(logo !== null);
++
+   // Logical canvas the preview renders captions into; scale that layer up to export res.
+   const { w: logicalW, h: logicalH } = logicalCanvasSize(width / height);
+   const scale = width / logicalW; // == height / logicalH (export keeps the same ratio)
+@@ -197,6 +206,9 @@ export function CaptionExportComposition({
+       {/* "Behind the subject" is NOT composited on this Remotion path. Behind-subject exports go
+           through Element Capture (ECStage), which draws the per-frame cut-out onto its own canvas. */}
+ 
++      {/* Brand Kit logo — mounted just before the watermark so the watermark always paints on top. */}
++      {logo && <BrandLogoOverlay logo={logo} frameWidth={width} frameHeight={height} onSettled={releaseLogo} />}
++
+       {!isPro && <Watermark />}
+     </AbsoluteFill>
+   );
+diff --git a/src/remotion/LambdaCaptionComposition.tsx b/src/remotion/LambdaCaptionComposition.tsx
+index 727cee2..fc75db3 100644
+--- a/src/remotion/LambdaCaptionComposition.tsx
++++ b/src/remotion/LambdaCaptionComposition.tsx
+@@ -1,6 +1,6 @@
+ 'use client';
+ 
+-import { useEffect, useState } from 'react';
++import { useEffect, useMemo, useState } from 'react';
+ import {
+   AbsoluteFill, continueRender, delayRender,
+   useCurrentFrame, useVideoConfig,
+@@ -17,6 +17,9 @@ import { CaptionOverlay } from '../components/editor/CaptionOverlay';
+ import { mergeTemplateSlots } from '../lib/kineticSlots';
+ import { fontFamiliesFromCss, referencedFontFamilies } from '../lib/fontFamilies';
+ import { logicalCanvasSize } from '../lib/aspect';
++import { sanitizeBrandLogo, type BrandLogoProps } from '../lib/brandLogo';
++import { BrandLogoOverlay } from './BrandLogoOverlay';
++import { useBrandLogoGate } from './useBrandLogoGate';
+ import {
+   buildFontsCss, buildIndicFontsCss, buildCustomFontCss, Watermark,
+   type CaptionStyleId,
+@@ -74,6 +77,18 @@ export interface LambdaCaptionProps {
+   lineTextOverrides?:     Record<string, Partial<TextOverrides>>;
+   templateSlots?:         TemplateSlotOverrides;
+   lineSlotOverrides?:     Record<string, TemplateSlotOverrides>;
++  /**
++   * Brand Kit logo (inline data URL + corner / size / opacity), drawn by the shared BrandLogoOverlay
++   * directly beneath the free-tier watermark.
++   *
++   * CLOUD EXPORTS ONLY SHOW THIS AFTER A REMOTION SITE REDEPLOY. Lambda renders the bundle that
++   * REMOTION_SERVE_URL points at, not this source tree. From a build containing this prop, run (repo
++   * root): `npx remotion lambda sites create src/remotion/index.tsx --site-name=captik` — it overwrites
++   * sites/captik/, so REMOTION_SERVE_URL stays the same. Until then the deployed composition never
++   * reads `brandLogo`: the route forwards it inside inputProps (renderBodySchema is a loose object),
++   * the old bundle ignores the unknown key, and the export succeeds exactly as before, minus the logo.
++   */
++  brandLogo?:             BrandLogoProps;
+ }
+ 
+ // Weights the caption styles actually use (Inter 800/900, Montserrat 600/700, Futura 700/900,
+@@ -94,12 +109,21 @@ export function LambdaCaptionComposition({
+   captionFontScale = 1.0, captionLines = 'single', captionGapMs = 0,
+   noVideo = false, transparent = false, auraAlphaLayer, customFontName, customFontDataUrl,
+   textOverrides, emphasisStyle, layoutMode, lineTextOverrides,
+-  templateSlots, lineSlotOverrides,
++  templateSlots, lineSlotOverrides, brandLogo,
+ }: LambdaCaptionProps) {
+   const frame = useCurrentFrame();
+   const { fps, width, height } = useVideoConfig();
+   const currentMs = (frame / fps) * 1000;
+ 
++  // Brand Kit logo: validated here because the route forwards the client's body verbatim (only an
++  // inline image data URL is accepted — never a URL to fetch), and frame capture is held until it has
++  // decoded. Aura's 'diff' overlay pass carries no logo, for the same reason it carries no watermark.
++  const logo = useMemo(
++    () => (auraAlphaLayer === 'diff' ? null : sanitizeBrandLogo(brandLogo)),
++    [brandLogo, auraAlphaLayer],
++  );
++  const releaseLogo = useBrandLogoGate(logo !== null);
++
+   // Logical canvas the preview renders captions into; scale that layer up to export res.
+   const { w: logicalW, h: logicalH } = logicalCanvasSize(width / height);
+   const scale = width / logicalW; // == height / logicalH (export keeps the same ratio)
+@@ -218,6 +242,10 @@ export function LambdaCaptionComposition({
+           ECStage), so behind-subject exports are routed there (like the Indic-script exports), not
+           to Lambda. Nothing to draw here. */}
+ 
++      {/* Brand Kit logo — same top-level layer as the watermark, mounted just before it so the
++          watermark always paints on top (the logo never hides or replaces it). */}
++      {logo && <BrandLogoOverlay logo={logo} frameWidth={width} frameHeight={height} onSettled={releaseLogo} />}
++
+       {/* Aura's 'diff' overlay pass carries no watermark — the 'base' pass already has it, and a
+           second copy would render INVERTED through the track's Difference blend. */}
+       {!isPro && auraAlphaLayer !== 'diff' && <Watermark />}
+diff --git a/src/remotion/useBrandLogoGate.ts b/src/remotion/useBrandLogoGate.ts
+new file mode 100644
+index 0000000..bce0be2
+--- /dev/null
++++ b/src/remotion/useBrandLogoGate.ts
+@@ -0,0 +1,19 @@
++import { useCallback, useRef, useState } from 'react';
++import { continueRender, delayRender } from 'remotion';
++
++/**
++ * Hold frame capture until the Brand Kit logo <img> has decoded, so the first exported frames can't
++ * be captured with the logo missing. Returns the release callback to hand BrandLogoOverlay's
++ * `onSettled`. Idempotent; a no-op when there is no logo. A logo that fails to load also releases
++ * (the frame renders without it) — a broken logo must never hang or fail an export.
++ */
++export function useBrandLogoGate(active: boolean): () => void {
++  const [handle] = useState(() =>
++    active ? delayRender('Decoding brand logo', { timeoutInMilliseconds: 30_000 }) : null);
++  const released = useRef(false);
++  return useCallback(() => {
++    if (handle === null || released.current) return;
++    released.current = true;
++    continueRender(handle);
++  }, [handle]);
++}

@@ -4,6 +4,8 @@
 /* Generate the utility classes Captik's editor components use. */
 @source "../../captik/src/components";
 @source "../../captik/src/lib";
+@source "../../captik-graphics/src/components";
+@source "../../captik-graphics/src/lib/graphics/templates";
 @source "./";
 
 /* next/font sets these variables in captik-app's root layout; here Geist comes from Google Fonts. */
